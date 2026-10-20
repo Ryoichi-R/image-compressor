@@ -1,0 +1,26 @@
+{
+    "schemaVersion": 1,
+    "selectedPresetId": "default",
+    "overrides": {
+        "maxWidth": null,
+        "maxHeight": null,
+        "quality": null,
+        "format": null
+    },
+    "inputPath": "",
+    "inputPaths": [],
+    "outputPath": "",
+    "targetSizeEnabled": false,
+    "targetKilobytes": 500,
+    "collisionPolicy": "AutoRename",
+    "largerOutputPolicy": "Skip",
+    "alreadyWithinTargetPolicy": "Copy",
+    "targetNonJpegPolicy": "ConvertToJpeg",
+    "includeSubfolders": false,
+    "preserveHierarchy": false,
+    "jpegBackgroundBlack": false,
+    "windowX": 220,
+    "windowY": 220,
+    "windowWidth": 1100,
+    "windowHeight": 800
+}

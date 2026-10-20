@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <!-- The production projects intentionally use only the .NET Windows Desktop shared framework. -->
+</Project>

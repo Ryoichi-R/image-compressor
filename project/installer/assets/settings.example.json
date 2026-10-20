@@ -1,0 +1,22 @@
+{
+    "schemaVersion": 1,
+    "selectedPresetId": "default",
+    "overrides": {
+        "maxWidth": 1920,
+        "maxHeight": 1080,
+        "quality": 75,
+        "format": "Jpeg"
+    },
+    "inputPath": "",
+    "inputPaths": [],
+    "outputPath": "",
+    "targetSizeEnabled": true,
+    "targetKilobytes": 500,
+    "targetNonJpegPolicy": "ConvertToJpeg",
+    "collisionPolicy": "AutoRename",
+    "largerOutputPolicy": "Warn",
+    "alreadyWithinTargetPolicy": "Copy",
+    "includeSubfolders": true,
+    "preserveHierarchy": true,
+    "jpegBackgroundBlack": false
+}

@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ImageCompressor.App/ImageCompressor.App.csproj" />
+    <Project Path="src/ImageCompressor.Domain/ImageCompressor.Domain.csproj" />
+    <Project Path="src/ImageCompressor.Infrastructure/ImageCompressor.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/unit/image-compressor-dotnet/ImageCompressor.Domain.Tests/ImageCompressor.Domain.Tests.csproj" />
+    <Project Path="tests/integration/image-compressor-dotnet/ImageCompressor.IntegrationTests/ImageCompressor.IntegrationTests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="_internal/spike/ImageCompressor.SpikeHarness/ImageCompressor.SpikeHarness.csproj" />
+  </Folder>
+</Solution>

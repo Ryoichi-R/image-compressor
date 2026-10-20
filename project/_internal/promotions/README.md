@@ -1,0 +1,5 @@
+# Promotion workspace
+
+このdirectoryは、local promotionの退避artifactとreceiptを置くための空の親directoryです。
+
+promotion履歴はowner-privateであり、source repositoryやRelease assetへ含めません。公開repositoryのfresh checkoutでも、このdirectoryを親としてpromotion scriptのpath contractを維持できます。

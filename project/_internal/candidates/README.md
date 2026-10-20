@@ -1,0 +1,5 @@
+# Candidate workspace
+
+このdirectoryは、release candidate builderが一意な子directoryを作成するための空の親directoryです。
+
+生成candidate、work file、receiptはowner-privateであり、source repositoryへ含めません。公開payloadはsymbolなしで生成します。公開対象は、正式監査を通過したcandidateから明示的に選んだRelease assetだけです。

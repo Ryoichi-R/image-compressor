@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0-windows7.0": {
+      "imagecompressor.app": {
+        "type": "Project",
+        "dependencies": {
+          "ImageCompressor.Domain": "[1.0.5, )",
+          "ImageCompressor.Infrastructure": "[1.0.5, )"
+        }
+      },
+      "imagecompressor.domain": {
+        "type": "Project"
+      },
+      "imagecompressor.infrastructure": {
+        "type": "Project",
+        "dependencies": {
+          "ImageCompressor.Domain": "[1.0.5, )"
+        }
+      }
+    },
+    "net10.0-windows7.0/win-arm64": {},
+    "net10.0-windows7.0/win-x64": {}
+  }
+}

@@ -1,0 +1,56 @@
+# Public source repository boundary
+#
+# Prebuilt payloads and release archives are distributed as GitHub Release
+# assets. A source checkout contains the installer implementation but no
+# self-contained runtime ZIPs.
+
+# .NET and test outputs
+**/bin/
+**/obj/
+**/TestResults/
+coverage/
+*.coverage
+*.trx
+
+# IDE and machine-local state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Temporary diagnostics
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Generated release outputs and owner-private release history
+project/dist/
+project/installer/payload/*.zip
+project/installer/payload/payload-manifest.json
+project/_internal/build-cache/
+project/_internal/operations/
+project/_internal/master-plan-execution-*.md
+
+project/_internal/candidates/*
+!project/_internal/candidates/README.md
+
+project/_internal/promotions/*
+!project/_internal/promotions/README.md
+
+project/_internal/rollback/*
+!project/_internal/rollback/README.md
+
+# Regenerable or superseded performance data
+project/_internal/baselines/runs/
+project/_internal/baselines/fixture-v1/
+
+# Source-only publication: keep baseline data and local results private
+project/_internal/baselines/*.json
+project/_internal/baselines/fixture-v2/
+project/testResults.xml
+.work/
+artifacts/
