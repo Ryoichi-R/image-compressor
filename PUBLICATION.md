@@ -4,7 +4,7 @@ Image Compressorは、公開sourceと配布artifactを分離して扱います�
 
 ## 公開sourceに含めるもの
 
-現在はソースのみを公開し、Release assetは公開しません。内部baselineの画像1,000枚と測定結果JSON6件は公開対象から除き、説明READMEとsolutionが参照する計測ツールのソースは保持します。
+sourceとRelease assetを分離し、version1.0.14の生成済み配布物はGitHub Releaseへ配置します。内部baselineの画像1,000枚と測定結果JSON6件は公開対象から除き、説明READMEとsolutionが参照する計測ツールのソースは保持します。
 
 - Release用の導入・更新BAT template、README、privacy／security文書
 - `project/src/`、`project/lib/`、`project/scripts/`、`project/tests/`、設計文書

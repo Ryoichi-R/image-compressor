@@ -15,7 +15,7 @@ Image Compressorは、Windows向けの画像一括縮小・圧縮アプリです
 
 ## インストール
 
-現在の公開対象はソースのみです。インストーラー・ZIP・Releaseは公開していません。以下は配布物を別途公開した場合の導入手順です。
+[Release 1.0.14](https://github.com/Ryoichi-R/image-compressor/releases/tag/v1.0.14)でinstaller（x64/ARM64同梱）とportable x64を提供します。検証済み範囲・既知の制限・SHA-256はRelease説明を確認してください。ARM64のportable起動にはinstaller ZIP内のinstaller/payload/ImageCompressor-win-arm64.zipを新しいフォルダーへ展開して使用できます。
 
 [GitHub Releases](https://github.com/Ryoichi-R/image-compressor/releases)から
 `image-compressor-installer.zip`をダウンロードして展開し、展開先直下の
@@ -53,7 +53,7 @@ source repositoryには自己完結payloadを含めないため、source checkou
 - Windows専用です。macOS／Linux GUIはsupport対象外です。
 - WebP、HEIC、AVIFは未対応です。
 - 複数フレームGIF／TIFFは既定で先頭フレームだけを出力し、logへ警告します。
-- ARM64 payloadはx64環境でPE architectureを検証していますが、今回のcandidateはARM64実機未確認です。
+- version1.0.14はWindows11 x64／ARM64で実機確認済みです。動的DPI切替後のチェック記号縮小、100%復帰後のボタン帯差、未確認の導入条件・応答時間は[Release説明](https://github.com/Ryoichi-R/image-compressor/releases/tag/v1.0.14)に記載しています。Windows10は今回実機未確認です。
 - 現在の配布binaryはcode signing未実施です。
 
 ## Privacy・security・公開範囲
