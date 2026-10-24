@@ -2,6 +2,7 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '_secret-path-guard.ps1')
 $roots = @(
     (Join-Path $PSScriptRoot '..\tests\unit\image-compressor-dotnet'),
     (Join-Path $PSScriptRoot '..\tests\integration\image-compressor-dotnet')
@@ -11,7 +12,10 @@ $violations = foreach ($root in $roots) {
         continue
     }
 
+    Assert-SafeFilePath -Path $root
     foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -Filter '*.cs' -File) {
+        if (Test-SecretFilePath -FilePath $file.FullName) { throw 'SECRET_PATH_REJECTED' }
+        Assert-SafeFilePath -Path $file.FullName
         $content = Get-Content -LiteralPath $file.FullName -Raw
         if ($content -match '\[(Fact|Theory)(?:Attribute)?(?:\(|\])' -and
             -not $file.Name.EndsWith('_spec.cs', [StringComparison]::OrdinalIgnoreCase)) {

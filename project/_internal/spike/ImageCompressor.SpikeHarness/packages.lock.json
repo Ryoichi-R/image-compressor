@@ -5,8 +5,8 @@
       "imagecompressor.app": {
         "type": "Project",
         "dependencies": {
-          "ImageCompressor.Domain": "[1.0.5, )",
-          "ImageCompressor.Infrastructure": "[1.0.5, )"
+          "ImageCompressor.Domain": "[1.0.14, )",
+          "ImageCompressor.Infrastructure": "[1.0.14, )"
         }
       },
       "imagecompressor.domain": {
@@ -15,7 +15,7 @@
       "imagecompressor.infrastructure": {
         "type": "Project",
         "dependencies": {
-          "ImageCompressor.Domain": "[1.0.5, )"
+          "ImageCompressor.Domain": "[1.0.14, )"
         }
       }
     },

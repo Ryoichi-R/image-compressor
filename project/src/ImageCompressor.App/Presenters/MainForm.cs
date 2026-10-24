@@ -26,7 +26,9 @@ public sealed class MainForm : Form
         Dock = DockStyle.Fill,
         ReadOnly = false,
         AllowUserToAddRows = false,
+        RowTemplate = new AccessibleFileRow(),
         AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+        ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
         AllowDrop = true,
     };
     private readonly TextBox log = new()
@@ -44,6 +46,7 @@ public sealed class MainForm : Form
     private readonly Button cancelButton = new() { Text = "キャンセル", Enabled = false, AutoSize = true };
     private readonly List<Control> configurationControls = [];
     private readonly SettingsStore settingsStore;
+    private readonly Func<string, string, MessageBoxButtons, MessageBoxIcon, DialogResult> showMessage;
     private List<string> inputPaths = [];
     private CancellationTokenSource? cancellation;
     private Task<IReadOnlyList<CompressionResult>>? processingTask;
@@ -51,13 +54,28 @@ public sealed class MainForm : Form
     private bool closeAfterProcessing;
 
     public MainForm(IReadOnlyList<string> startupPaths, bool minimized)
+        : this(startupPaths, minimized, new SettingsStore(AppContext.BaseDirectory), null)
     {
+    }
+
+    internal MainForm(
+        IReadOnlyList<string> startupPaths,
+        bool minimized,
+        SettingsStore settingsStore,
+        Func<string, string, MessageBoxButtons, MessageBoxIcon, DialogResult>? showMessage)
+    {
+        SuspendLayout();
+        AutoScaleDimensions = new(96F, 96F);
+        AutoScaleMode = AutoScaleMode.Dpi;
         Text = "Image Compressor";
         MinimumSize = new(900, 680);
         Size = new(1100, 800);
         AllowDrop = true;
-        settingsStore = new(AppContext.BaseDirectory);
+        this.settingsStore = settingsStore;
+        this.showMessage = showMessage ?? ((message, caption, buttons, icon) =>
+            MessageBox.Show(this, message, caption, buttons, icon));
         BuildLayout();
+        ResumeLayout(performLayout: true);
         WireEvents();
         LoadSettings();
         ApplyStartupPaths(startupPaths);
@@ -67,12 +85,79 @@ public sealed class MainForm : Form
         }
     }
 
+    protected override void OnShown(EventArgs e)
+    {
+        ConstrainToWorkingArea(Screen.FromControl(this).WorkingArea);
+        RefreshFileRowHeights();
+        base.OnShown(e);
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        if (!e.Cancel)
+        {
+            ConstrainToWorkingArea(Screen.FromControl(this).WorkingArea);
+            RefreshFileRowHeights();
+        }
+    }
+
+    internal void RefreshFileRowHeights()
+    {
+        if (!files.IsHandleCreated || files.IsDisposed)
+        {
+            return;
+        }
+
+        using var graphics = files.CreateGraphics();
+        var textHeight = TextRenderer.MeasureText(graphics, "Ag国", files.Font,
+            Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Height;
+        var padding = (8 * files.DeviceDpi + 95) / 96;
+        var minimumHeight = (22 * files.DeviceDpi + 95) / 96;
+        var height = Math.Max(minimumHeight, textHeight + padding);
+        files.SuspendLayout();
+        try
+        {
+            files.RowTemplate.Height = height;
+            foreach (DataGridViewRow row in files.Rows)
+            {
+                if (row.Height != height)
+                {
+                    row.Height = height;
+                }
+            }
+        }
+        finally
+        {
+            files.ResumeLayout();
+        }
+    }
+
+    internal void ConstrainToWorkingArea(Rectangle workingArea)
+    {
+        if (WindowState != FormWindowState.Normal)
+        {
+            return;
+        }
+
+        // A scaled minimum must not force the window below the taskbar or off screen.
+        MinimumSize = new(
+            Math.Min(LogicalToDeviceUnits(900), workingArea.Width),
+            Math.Min(LogicalToDeviceUnits(680), workingArea.Height));
+        var width = Math.Min(Width, workingArea.Width);
+        var height = Math.Min(Height, workingArea.Height);
+        Bounds = new(
+            Math.Clamp(Left, workingArea.Left, workingArea.Right - width),
+            Math.Clamp(Top, workingArea.Top, workingArea.Bottom - height),
+            width,
+            height);
+    }
+
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         if (processingTask is { IsCompleted: false } && !closeAfterProcessing)
         {
-            var answer = MessageBox.Show(
-                this,
+            var answer = showMessage(
                 "処理をキャンセルして、完了を待ってから終了しますか？",
                 "処理中です",
                 MessageBoxButtons.YesNo,
@@ -95,8 +180,7 @@ public sealed class MainForm : Form
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            MessageBox.Show(
-                this,
+            showMessage(
                 exception.Message,
                 "設定保存エラー",
                 MessageBoxButtons.OK,
@@ -130,6 +214,7 @@ public sealed class MainForm : Form
     {
         files.Columns.Add(new DataGridViewCheckBoxColumn
         {
+            CellTemplate = new AccessibleCheckBoxCell(),
             Name = "Target",
             HeaderText = "対象",
             FillWeight = 35,
@@ -144,6 +229,7 @@ public sealed class MainForm : Form
         {
             if (column.Name != "Target")
             {
+                column.CellTemplate = new AccessibleTextBoxCell();
                 column.ReadOnly = true;
             }
         }
@@ -155,6 +241,7 @@ public sealed class MainForm : Form
             RowCount = 6,
             Padding = new(8),
         };
+        root.ColumnStyles.Add(new(SizeType.Percent, 100));
         root.RowStyles.Add(new(SizeType.AutoSize));
         root.RowStyles.Add(new(SizeType.AutoSize));
         root.RowStyles.Add(new(SizeType.AutoSize));
@@ -245,6 +332,9 @@ public sealed class MainForm : Form
 
     private void WireEvents()
     {
+        files.HandleCreated += (_, _) => RefreshFileRowHeights();
+        files.FontChanged += (_, _) => RefreshFileRowHeights();
+        files.DpiChangedAfterParent += (_, _) => RefreshFileRowHeights();
         preset.DataSource = Presets.Items.ToList();
         preset.DisplayMember = nameof(PresetDefinition.DisplayName);
         preset.SelectedIndexChanged += (_, _) => ApplySelectedPreset();
@@ -290,7 +380,7 @@ public sealed class MainForm : Form
         {
             if (IsRunning)
             {
-                MessageBox.Show(this, "処理中は入力を変更できません。", "D&D", MessageBoxButtons.OK);
+                showMessage("処理中は入力を変更できません。", "D&D", MessageBoxButtons.OK, MessageBoxIcon.None);
                 return;
             }
 
@@ -330,13 +420,14 @@ public sealed class MainForm : Form
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
-            MessageBox.Show(this, exception.Message, "一覧更新エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            showMessage(exception.Message, "一覧更新エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
     private void RenderFileList(FileScanResult result)
     {
         files.Rows.Clear();
+        RefreshFileRowHeights();
         foreach (var source in result.Sources)
         {
             var index = files.Rows.Add(
@@ -411,7 +502,7 @@ public sealed class MainForm : Form
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
-            MessageBox.Show(this, exception.Message, "処理エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            showMessage(exception.Message, "処理エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
@@ -433,8 +524,7 @@ public sealed class MainForm : Form
         var confirmed = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         foreach (var plan in plans.Where(x => x.Action == PlanAction.Confirm))
         {
-            confirmed[plan.OutputPath] = MessageBox.Show(
-                this,
+            confirmed[plan.OutputPath] = showMessage(
                 $"{plan.OutputPath}\nを上書きしますか？",
                 "上書き確認",
                 MessageBoxButtons.YesNo,

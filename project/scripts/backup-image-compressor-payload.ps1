@@ -7,6 +7,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '_secret-path-guard.ps1')
 
 function Get-NormalizedDirectoryPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -22,6 +23,9 @@ function Assert-PathWithinRoot {
         [Parameter(Mandatory)][string]$Root
     )
 
+    if (Test-SecretFilePath -FilePath $Path) { throw 'SECRET_PATH_REJECTED' }
+    Assert-SafeFilePath -Path $Path
+    Assert-SafeFilePath -Path $Root
     $rootFull = Get-NormalizedDirectoryPath -Path $Root
     $pathFull = [IO.Path]::GetFullPath($Path)
     if ($pathFull -ne $rootFull -and
@@ -36,6 +40,7 @@ function Assert-PathWithinRoot {
 function Assert-NotReparsePoint {
     param([Parameter(Mandatory)][string]$Path)
 
+    Assert-SafeFilePath -Path $Path
     if ((Get-Item -LiteralPath $Path -Force).Attributes -band
         [IO.FileAttributes]::ReparsePoint) {
         throw "Reparse points are not allowed: $Path"
@@ -48,6 +53,7 @@ function Write-JsonFile {
         [Parameter(Mandatory)][string]$Path
     )
 
+    Assert-SafeFilePath -Path $Path
     $json = $Value | ConvertTo-Json -Depth 10
     [IO.File]::WriteAllText(
         $Path,
@@ -59,6 +65,7 @@ function Write-JsonFile {
 $projectRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $workspaceRoot = [IO.Path]::GetFullPath(
     (Split-Path -Parent (Split-Path -Parent $projectRoot)))
+Assert-SafeFilePath -Path $projectRoot
 $rollbackRoot = Assert-PathWithinRoot `
     -Path (Join-Path $projectRoot '_internal\rollback') `
     -Root $workspaceRoot

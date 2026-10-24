@@ -14,6 +14,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '_secret-path-guard.ps1')
 
 function Get-NormalizedPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -29,6 +30,9 @@ function Assert-PathWithinRoot {
         [Parameter(Mandatory)][string]$Root
     )
 
+    if (Test-SecretFilePath -FilePath $Path) { throw 'SECRET_PATH_REJECTED' }
+    Assert-SafeFilePath -Path $Path
+    Assert-SafeFilePath -Path $Root
     $rootFull = Get-NormalizedPath -Path $Root
     $pathFull = [IO.Path]::GetFullPath($Path)
     if ($pathFull -ne $rootFull -and
@@ -43,6 +47,7 @@ function Assert-PathWithinRoot {
 function Assert-NotReparsePoint {
     param([Parameter(Mandatory)][string]$Path)
 
+    Assert-SafeFilePath -Path $Path
     if ((Get-Item -LiteralPath $Path -Force).Attributes -band
         [IO.FileAttributes]::ReparsePoint) {
         throw "Reparse points are not allowed: $Path"
@@ -91,10 +96,14 @@ $promotionRoot = Join-Path $projectRoot '_internal\promotions'
 $currentPayloadRoot = Join-Path $projectRoot 'installer\payload'
 $distributionTarget = Join-Path $projectRoot 'dist'
 
+Assert-SafeFilePath -Path $projectRoot
 $candidate = Assert-PathWithinRoot -Path $CandidateRoot -Root $candidateRootAllowed
 $backupManifestPath = Assert-PathWithinRoot `
     -Path $PayloadBackupManifest `
     -Root $rollbackRoot
+Assert-SafeFileTree -Path $candidate
+Assert-SafeFileTree -Path $currentPayloadRoot
+Assert-SafeFileTree -Path $distributionTarget
 foreach ($requiredDirectory in $candidate, $currentPayloadRoot) {
     if (-not (Test-Path -LiteralPath $requiredDirectory -PathType Container)) {
         throw "Required directory is missing: $requiredDirectory"

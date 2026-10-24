@@ -12,23 +12,16 @@ if not exist "%INSTALLER_DIR%\Install-ImageCompressor.ps1" goto :missing
 :installer_found
 if not exist "%INSTALLER_DIR%\payload\payload-manifest.json" goto :missing
 
-if defined PROCESSOR_ARCHITEW6432 (
-  set "NATIVE_ARCH=%PROCESSOR_ARCHITEW6432%"
-) else (
-  set "NATIVE_ARCH=%PROCESSOR_ARCHITECTURE%"
-)
-
-if /i "%NATIVE_ARCH%"=="AMD64" set "RUNTIME=win-x64"
-if /i "%NATIVE_ARCH%"=="ARM64" set "RUNTIME=win-arm64"
-if not defined RUNTIME goto :unsupported
+rem The installer resolves the native OS architecture, not the parent process.
+set "RUNTIME=auto"
 
 if defined IMAGE_COMPRESSOR_INSTALLER_TEST_PROBE goto :probe
 
 if "%~1"=="" (
-  powershell.exe -STA -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%INSTALLER_DIR%\Install-ImageCompressor.ps1" -Runtime "%RUNTIME%" -SelectOutputRoot -RevealOutput
+  powershell.exe -STA -NoLogo -NoProfile -File "%INSTALLER_DIR%\Install-ImageCompressor.ps1" -Runtime "%RUNTIME%" -SelectOutputRoot -RevealOutput
 ) else (
   set "IMAGE_COMPRESSOR_INSTALL_ROOT=%~f1"
-  powershell.exe -STA -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%INSTALLER_DIR%\Install-ImageCompressor.ps1" -Runtime "%RUNTIME%" -OutputRootFromEnvironment -RevealOutput
+  powershell.exe -STA -NoLogo -NoProfile -File "%INSTALLER_DIR%\Install-ImageCompressor.ps1" -Runtime "%RUNTIME%" -OutputRootFromEnvironment -RevealOutput
 )
 set "EXIT_CODE=%ERRORLEVEL%"
 goto :result
@@ -52,6 +45,7 @@ if "%EXIT_CODE%"=="3" (
 if not "%EXIT_CODE%"=="0" (
   echo Image Compressor installation/update failed with exit code %EXIT_CODE%.
   echo Review the error above. The previous working installation was restored when possible.
+  echo If script execution was denied, follow the README. Do not bypass your execution policy.
   pause
   exit /b %EXIT_CODE%
 )
@@ -78,8 +72,3 @@ echo https://github.com/Ryoichi-R/image-compressor/releases
 pause
 exit /b 1
 
-:unsupported
-echo Unsupported native Windows architecture: "%NATIVE_ARCH%"
-echo Supported architectures: AMD64 and ARM64.
-pause
-exit /b 1

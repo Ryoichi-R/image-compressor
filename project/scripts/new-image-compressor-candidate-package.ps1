@@ -11,6 +11,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '_secret-path-guard.ps1')
 
 function Get-NormalizedDirectoryPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -26,6 +27,9 @@ function Assert-PathWithinRoot {
         [Parameter(Mandatory)][string]$Root
     )
 
+    if (Test-SecretFilePath -FilePath $Path) { throw 'SECRET_PATH_REJECTED' }
+    Assert-SafeFilePath -Path $Path
+    Assert-SafeFilePath -Path $Root
     $rootFull = Get-NormalizedDirectoryPath -Path $Root
     $pathFull = [IO.Path]::GetFullPath($Path)
     if ($pathFull -ne $rootFull -and
@@ -40,6 +44,7 @@ function Assert-PathWithinRoot {
 function Assert-NotReparsePoint {
     param([Parameter(Mandatory)][string]$Path)
 
+    Assert-SafeFilePath -Path $Path
     if ((Get-Item -LiteralPath $Path -Force).Attributes -band
         [IO.FileAttributes]::ReparsePoint) {
         throw "Reparse points are not allowed: $Path"
@@ -49,6 +54,7 @@ function Assert-NotReparsePoint {
 function Get-PeMachine {
     param([Parameter(Mandatory)][string]$Path)
 
+    Assert-SafeFilePath -Path $Path
     $stream = [IO.File]::OpenRead($Path)
     try {
         $reader = [IO.BinaryReader]::new($stream)
@@ -71,6 +77,7 @@ function Test-FileContainsUtf8Text {
         [Parameter(Mandatory)][string]$Text
     )
 
+    Assert-SafeFilePath -Path $Path
     $carry = ''
     $buffer = [byte[]]::new(4MB)
     $stream = [IO.File]::OpenRead($Path)
@@ -101,6 +108,7 @@ function Write-JsonFile {
         [Parameter(Mandatory)][string]$Path
     )
 
+    Assert-SafeFilePath -Path $Path
     $json = $Value | ConvertTo-Json -Depth 12
     [IO.File]::WriteAllText(
         $Path,
@@ -115,6 +123,7 @@ function Get-FileRecord {
         [Parameter(Mandatory)][string]$Name
     )
 
+    Assert-SafeFilePath -Path $Path
     $item = Get-Item -LiteralPath $Path
     return [ordered]@{
         name = $Name.Replace('\', '/')
@@ -135,6 +144,7 @@ function Get-CanonicalSourceDigest {
             (Join-Path $ProjectRoot 'src'),
             (Join-Path $ProjectRoot 'installer\assets')
         )) {
+        Assert-SafeFileTree -Path $root
         foreach ($file in Get-ChildItem -LiteralPath $root -File -Recurse) {
             if ($file.FullName -match '[\\/](bin|obj)[\\/]') {
                 continue
@@ -153,10 +163,12 @@ function Get-CanonicalSourceDigest {
             (Join-Path $ProjectRoot 'image-compressor.bat'),
             (Join-Path $ProjectRoot 'installer\Install-ImageCompressor.ps1'),
             (Join-Path $ProjectRoot 'installer\README.md'),
+            (Join-Path $ProjectRoot 'scripts\_secret-path-guard.ps1'),
             (Join-Path $ProjectRoot 'scripts\backup-image-compressor-payload.ps1'),
             (Join-Path $ProjectRoot 'scripts\build-image-compressor-installer-package.ps1'),
             (Join-Path $ProjectRoot 'scripts\new-image-compressor-candidate-package.ps1'),
             (Join-Path $FacadeRoot 'README.md'),
+            (Join-Path $FacadeRoot 'LICENSE'),
             (Join-Path $FacadeRoot 'ここから開始 - Image Compressorを導入・更新.bat')
         )) {
         $files.Add([IO.Path]::GetFullPath($path))
@@ -173,6 +185,7 @@ function Get-CanonicalSourceDigest {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
                 throw "Canonical build input is missing: $file"
             }
+            Assert-SafeFilePath -Path $file
             $relative = [IO.Path]::GetRelativePath($WorkspaceRoot, $file).Replace('\', '/')
             $item = Get-Item -LiteralPath $file
             $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
@@ -268,6 +281,7 @@ function Test-SameVersionContent {
 $projectRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $facadeRoot = [IO.Path]::GetFullPath((Split-Path -Parent $projectRoot))
 $workspaceRoot = [IO.Path]::GetFullPath((Split-Path -Parent $facadeRoot))
+Assert-SafeFilePath -Path $facadeRoot
 $rollbackRoot = Assert-PathWithinRoot `
     -Path (Join-Path $projectRoot '_internal\rollback') `
     -Root $workspaceRoot
@@ -313,6 +327,7 @@ foreach ($requiredBuildFile in @(
         (Join-Path $projectRoot 'global.json'),
         (Join-Path $projectRoot 'NuGet.config')
     )) {
+    Assert-SafeFilePath -Path $requiredBuildFile
     if (-not (Test-Path -LiteralPath $requiredBuildFile -PathType Leaf)) {
         throw "Required reproducibility file is missing: $requiredBuildFile"
     }
@@ -323,12 +338,14 @@ if ($lockFiles.Count -lt 3) {
     throw 'Expected project lock files are missing. Run the approved lockfile generation first.'
 }
 
+Assert-SafeFilePath -Path (Join-Path $projectRoot 'Directory.Build.props')
 [xml]$buildProps = Get-Content -LiteralPath (Join-Path $projectRoot 'Directory.Build.props') -Raw
 $productVersion = [string]$buildProps.Project.PropertyGroup.Version
 if ([string]::IsNullOrWhiteSpace($productVersion)) {
     throw 'Product version is missing from Directory.Build.props.'
 }
 $project = Join-Path $projectRoot 'src\ImageCompressor.App\ImageCompressor.App.csproj'
+Assert-SafeFilePath -Path $project
 [xml]$appProject = Get-Content -LiteralPath $project -Raw
 $runtimeFrameworkVersion = [string]$appProject.Project.PropertyGroup.RuntimeFrameworkVersion
 if ([string]::IsNullOrWhiteSpace($runtimeFrameworkVersion)) {
@@ -358,10 +375,12 @@ foreach ($directory in $payloadRoot, $distRoot, $distributionRoot, $workRoot) {
 $entryBatch = Join-Path $facadeRoot 'ここから開始 - Image Compressorを導入・更新.bat'
 $installerScript = Join-Path $projectRoot 'installer\Install-ImageCompressor.ps1'
 $packageReadme = Join-Path $projectRoot 'installer\README.md'
-$appReadme = Join-Path $projectRoot 'README.md'
+$appReadme = Join-Path $projectRoot 'installer\assets\README-portable.md'
 $settings = Join-Path $projectRoot 'installer\assets\settings.json'
 $settingsExample = Join-Path $projectRoot 'installer\assets\settings.example.json'
 $legalFiles = [ordered]@{
+    'LICENSE' = Join-Path $facadeRoot 'LICENSE'
+    'DOTNET-LIBRARY-LICENSE.html' = Join-Path $projectRoot 'installer\assets\legal\DOTNET-LIBRARY-LICENSE.html'
     'DOTNET-LICENSE.txt' = Join-Path $projectRoot 'installer\assets\legal\DOTNET-LICENSE.txt'
     'DOTNET-THIRD-PARTY-NOTICES.txt' = Join-Path $projectRoot (
         'installer\assets\legal\DOTNET-THIRD-PARTY-NOTICES.txt')
@@ -407,6 +426,7 @@ foreach ($runtime in 'win-x64', 'win-arm64') {
     if (-not (Test-Path -LiteralPath $runtimeListPath -PathType Leaf)) {
         throw "WindowsDesktop runtime list is missing for $runtime`: $runtimeListPath"
     }
+    Assert-SafeFilePath -Path $runtimeListPath
     [xml]$runtimeList = Get-Content -LiteralPath $runtimeListPath -Raw
     $missingRuntimeFiles = @(
         foreach ($runtimeFile in $runtimeList.FileList.File) {
@@ -456,6 +476,8 @@ foreach ($definition in @(
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:ContinuousIntegrationBuild=true `
+            -p:EnableSourceControlManagerQueries=false `
+            -p:IncludeSourceRevisionInInformationalVersion=false `
             "-p:InformationalVersion=$informationalVersion" `
             -p:DebugType=None `
             -p:DebugSymbols=false
@@ -482,6 +504,8 @@ foreach ($definition in @(
     }
 
     $expectedNames = @(
+        'LICENSE',
+        'DOTNET-LIBRARY-LICENSE.html',
         'DOTNET-LICENSE.txt',
         'DOTNET-THIRD-PARTY-NOTICES.txt',
         'ImageCompressor.App.exe',
@@ -509,7 +533,9 @@ foreach ($definition in @(
 
     $managedFiles = @(
         foreach ($name in @(
-                'DOTNET-LICENSE.txt',
+                'LICENSE',
+                'DOTNET-LIBRARY-LICENSE.html',
+        'DOTNET-LICENSE.txt',
                 'DOTNET-THIRD-PARTY-NOTICES.txt',
                 'ImageCompressor.App.exe',
                 'README.md',
@@ -562,6 +588,7 @@ Write-JsonFile -Path $payloadManifestPath -Value ([ordered]@{
         payloads = $payloads
     })
 
+Copy-Item -LiteralPath (Join-Path $facadeRoot 'LICENSE') -Destination (Join-Path $distributionRoot 'LICENSE')
 Copy-Item -LiteralPath $entryBatch -Destination $distributionRoot
 Copy-Item -LiteralPath $packageReadme -Destination (Join-Path $distributionRoot 'README.md')
 $distributionInstaller = Join-Path $distributionRoot 'installer'

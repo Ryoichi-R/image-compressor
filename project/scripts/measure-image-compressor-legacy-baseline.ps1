@@ -8,6 +8,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '_secret-path-guard.ps1')
+foreach ($operand in @($FixtureRoot, $OutputRoot, $ReportPath)) {
+    if (Test-SecretFilePath -FilePath $operand) { throw 'SECRET_PATH_REJECTED' }
+    Assert-SafeFilePath -Path $operand
+}
 Add-Type -AssemblyName System.Drawing
 
 if (-not ('ImageCompressorBaseline.NativeMethods' -as [type])) {
@@ -92,6 +97,7 @@ $sha = [Security.Cryptography.IncrementalHash]::CreateHash(
     [Security.Cryptography.HashAlgorithmName]::SHA256)
 try {
     foreach ($file in $files) {
+        Assert-SafeFilePath -Path $file.FullName
         $relative = [Text.Encoding]::UTF8.GetBytes($file.Name)
         $sha.AppendData($relative)
         $sha.AppendData([IO.File]::ReadAllBytes($file.FullName))

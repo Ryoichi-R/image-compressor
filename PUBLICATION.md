@@ -10,8 +10,8 @@ Image Compressorは、公開sourceと配布artifactを分離して扱います�
 - `project/src/`、`project/lib/`、`project/scripts/`、`project/tests/`、設計文書
 - SDK、NuGet source、lockfileなどの再現性契約
 - `project/installer/`のinstaller実装、文書、設定、legal asset
-- `.NET 10.0.10`のライセンス・第三者通知asset
-- 性能再測定に必要な`fixture-v2`、正本report、spike harness
+- `.NET 10.0.13`のライセンス・第三者通知asset
+- 性能再測定用のspike harness sourceと手順README（fixture画像・測定report本体は非同梱）
 - candidate／promotion／rollback用の空ディレクトリ契約README
 
 `project/installer/payload/`の自己完結ZIPと`payload-manifest.json`は公開sourceへ含めません。
@@ -40,7 +40,7 @@ GitHub Releaseの`image-compressor-installer.zip`で提供します。
 - `image-compressor-portable-win-x64.zip`
 - `image-compressor-installer.manifest.json`
 
-candidate receipt、payload backup、build cacheは公開しません。公開assetとsource repositoryは、同じ`productVersion`、`buildId`、`sourceDigest`へ結び付けます。公開payloadはsymbolなしで生成し、ローカルbuild pathが実行ファイルへ埋め込まれていないことを検証します。
+candidate receipt、payload backup、build cacheは公開しません。公開assetとsource repositoryは、同じ`productVersion`、`buildId`、`sourceDigest`へ結び付けます。本体のMIT LICENSEを各runtime payload・portable ZIP・外側installer ZIPへ同梱し、第三者通知と分けて検証します。公開payloadはsymbolなしで生成し、ローカルbuild pathが実行ファイルへ埋め込まれていないことを検証します。
 
 ## 公開前確認
 

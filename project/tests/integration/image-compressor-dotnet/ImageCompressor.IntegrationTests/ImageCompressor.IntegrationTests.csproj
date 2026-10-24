@@ -18,6 +18,7 @@
     <Using Include="Xunit" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\..\..\src\ImageCompressor.App\ImageCompressor.App.csproj" />
     <ProjectReference Include="..\..\..\..\src\ImageCompressor.Domain\ImageCompressor.Domain.csproj" />
     <ProjectReference Include="..\..\..\..\src\ImageCompressor.Infrastructure\ImageCompressor.Infrastructure.csproj" />
   </ItemGroup>

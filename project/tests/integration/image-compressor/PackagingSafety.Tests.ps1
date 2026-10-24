@@ -1,6 +1,7 @@
 Describe 'Image Compressor candidate packaging safety' -Tag 'WindowsOnly' {
     BeforeAll {
         $script:projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
+        . (Join-Path $script:projectRoot 'scripts/_secret-path-guard.ps1')
         $script:payloadRoot = Join-Path $script:projectRoot 'installer\payload'
         $script:builder = Join-Path $script:projectRoot 'scripts\build-image-compressor-installer-package.ps1'
         $script:candidateBuilder = Join-Path $script:projectRoot 'scripts\new-image-compressor-candidate-package.ps1'
@@ -76,6 +77,23 @@ Describe 'Image Compressor candidate packaging safety' -Tag 'WindowsOnly' {
         ).Count | Should -BeGreaterOrEqual 6
     }
 
+    It '配布READMEはpayloadのEXEとportable設定を案内し開発BATを案内しない' {
+        $readme = Get-Content -LiteralPath (
+            Join-Path $script:projectRoot 'installer\assets\README-portable.md') -Raw
+        $readme | Should -Match 'ImageCompressor\.App\.exe'
+        $readme | Should -Match 'settings\.json'
+        $readme | Should -Not -Match 'image-compressor\.bat'
+        (Get-Content -LiteralPath $script:candidateBuilder -Raw) |
+            Should -Match "\`$appReadme = Join-Path \`$projectRoot 'installer\\assets\\README-portable\.md'"
+    }
+
+    It '導入launcherは既存実行policyを変更も迂回もしない' {
+        $launcher = Get-Content -LiteralPath (
+            Join-Path (Split-Path -Parent $script:projectRoot) 'ここから開始 - Image Compressorを導入・更新.bat') -Raw
+        $launcher | Should -Not -Match '(?i)-ExecutionPolicy|Set-ExecutionPolicy|Unblock-File|EncodedCommand'
+        $launcher | Should -Match 'powershell\.exe -STA -NoLogo -NoProfile -File'
+    }
+
     It '正規source digestはsrc配下のbinとobj生成物に依存しない' {
         $tokens = $null
         $parseErrors = $null
@@ -116,6 +134,7 @@ Describe 'Image Compressor candidate packaging safety' -Tag 'WindowsOnly' {
                 'installer\Install-ImageCompressor.ps1',
                 'installer\README.md',
                 'installer\assets\settings.json',
+                'scripts\_secret-path-guard.ps1',
                 'scripts\backup-image-compressor-payload.ps1',
                 'scripts\build-image-compressor-installer-package.ps1',
                 'scripts\new-image-compressor-candidate-package.ps1',
@@ -126,6 +145,7 @@ Describe 'Image Compressor candidate packaging safety' -Tag 'WindowsOnly' {
             Set-Content -LiteralPath $path -Value $relativeFile -Encoding utf8NoBOM
         }
         Set-Content -LiteralPath (Join-Path $facadeRoot 'README.md') -Value 'facade' -Encoding utf8NoBOM
+        Set-Content -LiteralPath (Join-Path $facadeRoot 'LICENSE') -Value 'original-license' -Encoding utf8NoBOM
         Set-Content `
             -LiteralPath (Join-Path $facadeRoot 'ここから開始 - Image Compressorを導入・更新.bat') `
             -Value 'launcher' `
@@ -158,5 +178,18 @@ Describe 'Image Compressor candidate packaging safety' -Tag 'WindowsOnly' {
             -FacadeRoot $facadeRoot `
             -WorkspaceRoot $workspaceRoot
         $afterSourceChange | Should -Not -Be $before
+
+        Set-Content -LiteralPath (Join-Path $facadeRoot 'LICENSE') -Value 'changed-license' -Encoding utf8NoBOM
+        $afterLicenseChange = Get-CanonicalSourceDigest `
+            -ProjectRoot $projectRoot `
+            -FacadeRoot $facadeRoot `
+            -WorkspaceRoot $workspaceRoot
+        $afterLicenseChange | Should -Not -Be $afterSourceChange
+
+        Set-Content -LiteralPath (Join-Path $projectRoot 'installer\assets\README-portable.md') `
+            -Value 'portable-readme' -Encoding utf8NoBOM
+        $afterReadmeChange = Get-CanonicalSourceDigest `
+            -ProjectRoot $projectRoot -FacadeRoot $facadeRoot -WorkspaceRoot $workspaceRoot
+        $afterReadmeChange | Should -Not -Be $afterLicenseChange
     }
 }

@@ -37,7 +37,10 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
             )
 
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
-            $startInfo.FileName = 'powershell.exe'
+            $startInfo.FileName = if ($env:IMAGE_COMPRESSOR_TEST_POWERSHELL_EXE) {
+                $env:IMAGE_COMPRESSOR_TEST_POWERSHELL_EXE
+            }
+            else { 'powershell.exe' }
             $startInfo.UseShellExecute = $false
             $startInfo.CreateNoWindow = $true
             $startInfo.RedirectStandardOutput = $true
@@ -45,8 +48,6 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
             foreach ($argument in @(
                     '-NoLogo',
                     '-NoProfile',
-                    '-ExecutionPolicy',
-                    'Bypass',
                     '-File',
                     $InstallerPath,
                     '-Runtime',
@@ -129,6 +130,7 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
         function Wait-TestExecutableUnlocked {
             param([Parameter(Mandatory)][string]$Path)
 
+            $stableSamples = 0
             for ($attempt = 0; $attempt -lt 50; $attempt++) {
                 $stream = $null
                 try {
@@ -137,22 +139,24 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
                         [IO.FileMode]::Open,
                         [IO.FileAccess]::ReadWrite,
                         [IO.FileShare]::None)
-                    return
+                    $stableSamples++
+                    if ($stableSamples -ge 15) { return }
                 }
                 catch [IO.IOException] {
-                    Start-Sleep -Milliseconds 100
+                    $stableSamples = 0
                 }
                 finally {
                     if ($null -ne $stream) {
                         $stream.Dispose()
                     }
                 }
+                Start-Sleep -Milliseconds 100
             }
             throw "Executable remained locked after process exit: $Path"
         }
     }
 
-    It '実cmd入口が特殊文字を含む親folderをx64 routingしてそのまま渡す' {
+    It '実cmd入口が特殊文字pathとauto判定要求をinstallerへ渡す' {
         $probe = Join-Path $TestDrive 'installer-probe.cmd'
         $probeOutput = Join-Path $TestDrive 'installer-probe.txt'
         @'
@@ -187,11 +191,19 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
 
         $process.ExitCode | Should -Be 0
         $lines = @(Get-Content -LiteralPath $probeOutput -Encoding oem)
-        $lines[0] | Should -Be 'RUNTIME=[win-x64]'
+        $lines[0] | Should -Be 'RUNTIME=[auto]'
         $lines[1] | Should -Be "IMAGE_COMPRESSOR_INSTALL_ROOT=$($script:parent)"
     }
 
-    It 'workspace直下の入口がproject内installerを検出してx64 routingする' {
+    It 'workspace直下の入口がproject内installerを検出しauto判定を渡す' {
+        $facadeRoot = Join-Path $TestDrive 'source-layout-facade'
+        $fixtureInstaller = Join-Path $facadeRoot 'project\installer'
+        $fixturePayload = Join-Path $fixtureInstaller 'payload'
+        New-Item -ItemType Directory -Path $fixturePayload -Force | Out-Null
+        $fixtureEntry = Join-Path $facadeRoot 'ここから開始 - Image Compressorを導入・更新.bat'
+        Copy-Item -LiteralPath $script:facadeEntryBatch -Destination $fixtureEntry
+        Copy-Item -LiteralPath $script:installer -Destination $fixtureInstaller
+        Copy-Item -LiteralPath (Join-Path $script:payloadRoot 'payload-manifest.json') -Destination $fixturePayload
         $probe = Join-Path $TestDrive 'facade-installer-probe.cmd'
         $probeOutput = Join-Path $TestDrive 'facade-installer-probe.txt'
         @'
@@ -205,7 +217,7 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
         $startInfo.ArgumentList.Add('/d')
         $startInfo.ArgumentList.Add('/c')
         $startInfo.ArgumentList.Add('call')
-        $startInfo.ArgumentList.Add($script:facadeEntryBatch)
+        $startInfo.ArgumentList.Add($fixtureEntry)
         $startInfo.Environment['IMAGE_COMPRESSOR_INSTALLER_TEST_PROBE'] = $probe
         $startInfo.Environment['IMAGE_COMPRESSOR_INSTALLER_PROBE_OUTPUT'] = $probeOutput
         $startInfo.Environment['PROCESSOR_ARCHITECTURE'] = 'AMD64'
@@ -215,10 +227,35 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
 
         $process.ExitCode | Should -Be 0
         (Get-Content -LiteralPath $probeOutput -Raw).Trim() |
-            Should -Be 'RUNTIME=[win-x64]'
+            Should -Be 'RUNTIME=[auto]'
     }
 
-    It 'entry BATがARM64 native environmentをwin-arm64へ振り分ける' {
+    It 'source-only入口はpayload不在を拒否しsourceを変更しない' {
+        $sourcePayload = Join-Path $script:projectRoot 'installer\payload'
+        Test-Path -LiteralPath $sourcePayload | Should -BeFalse
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = 'cmd.exe'
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        foreach ($arg in @('/d', '/c', 'call', $script:facadeEntryBatch)) {
+            $startInfo.ArgumentList.Add($arg)
+        }
+        $process = [Diagnostics.Process]::Start($startInfo)
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.WriteLine(' ')
+        $process.StandardInput.Close()
+        $process.WaitForExit(10000) | Should -BeTrue
+        $process.ExitCode | Should -Be 1
+        $stderr.Result | Should -BeNullOrEmpty
+        $stdout.Result | Should -Match 'Source checkouts do not include prebuilt payloads'
+        Test-Path -LiteralPath $sourcePayload | Should -BeFalse
+        $process.Dispose()
+    }
+    It 'entry BATは親のARM64環境でもOS native判定をinstallerへ委譲する' {
         $probe = Join-Path $TestDrive 'installer-probe-arm64.cmd'
         $probeOutput = Join-Path $TestDrive 'installer-probe-arm64.txt'
         @'
@@ -241,7 +278,29 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
 
         $process.ExitCode | Should -Be 0
         (Get-Content -LiteralPath $probeOutput -Raw).Trim() |
-            Should -Be 'RUNTIME=[win-arm64]'
+            Should -Be 'RUNTIME=[auto]'
+    }
+
+    It 'autoのread-only判定はpayloadや導入先がなくてもstateを生成しない' {
+        $missing = Join-Path $TestDrive 'runtime-detect-no-input'
+        $result = Invoke-TestInstaller -Runtime auto -OutputRoot $missing `
+            -InstallerStateRoot (Join-Path $missing 'state') `
+            -ExtraArguments @('-DetectRuntimeOnly', '-PackageRoot', $missing)
+
+        $result.ExitCode | Should -Be 0
+        $result.Output.Trim() | Should -Be 'win-x64'
+        Test-Path -LiteralPath $missing | Should -BeFalse
+    }
+
+    It 'auto判定で同じPCのnative x64版を隔離導入する' {
+        $parent = Join-Path $TestDrive 'auto-native-install'
+        New-Item -ItemType Directory -Path $parent | Out-Null
+        $result = Invoke-TestInstaller -Runtime auto -OutputRoot $parent
+        $result.ExitCode | Should -Be 0
+        $marker = Get-Content -LiteralPath (
+            Join-Path $parent 'Image Compressor/.image-compressor-install.json'
+        ) -Raw | ConvertFrom-Json
+        $marker.runtime | Should -Be 'win-x64'
     }
 
     It 'x64とARM64 payloadのSHA-256とPE machineがmanifestに一致する' {
@@ -250,12 +309,29 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
         $script:payloadManifest.sourceDigest | Should -Match '^[0-9A-F]{64}$'
         foreach ($runtime in 'win-x64', 'win-arm64') {
             $payload = $script:payloadManifest.payloads.PSObject.Properties[$runtime].Value
+            @($payload.managedFiles.name) | Should -Contain 'LICENSE'
+            $licenseSource = Join-Path (Split-Path -Parent $script:projectRoot) 'LICENSE'
             $archive = Join-Path $script:payloadRoot $payload.archive
             (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash |
                 Should -Be $payload.sha256
             $extract = Join-Path $TestDrive "payload-$runtime"
             [IO.Compression.ZipFile]::ExtractToDirectory($archive, $extract)
+            (Get-FileHash -LiteralPath (Join-Path $extract 'LICENSE') -Algorithm SHA256).Hash |
+                Should -Be (Get-FileHash -LiteralPath $licenseSource -Algorithm SHA256).Hash
+            (Get-FileHash -LiteralPath (Join-Path $script:distributionRoot 'LICENSE') -Algorithm SHA256).Hash |
+                Should -Be (Get-FileHash -LiteralPath $licenseSource -Algorithm SHA256).Hash
+            foreach ($legalName in @(
+                    'DOTNET-LIBRARY-LICENSE.html',
+                    'DOTNET-LICENSE.txt',
+                    'DOTNET-THIRD-PARTY-NOTICES.txt',
+                    'WINDOWSDESKTOP-LICENSE.txt')) {
+                @($payload.managedFiles.name) | Should -Contain $legalName
+                (Get-FileHash -LiteralPath (Join-Path $extract $legalName) -Algorithm SHA256).Hash |
+                    Should -Be (Get-FileHash -LiteralPath (Join-Path $script:projectRoot "installer/assets/legal/$legalName") -Algorithm SHA256).Hash
+            }
             $machine = Get-TestPeMachine -Path (Join-Path $extract 'ImageCompressor.App.exe')
+            [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $extract 'ImageCompressor.App.exe')).ProductVersion |
+                Should -BeExactly ($script:payloadManifest.productVersion + '+' + $script:payloadManifest.buildId)
             $machine | Should -Be ([int]$payload.peMachine)
             $machine | Should -Be $(if ($runtime -eq 'win-arm64') { 0xAA64 } else { 0x8664 })
             $workspaceRoot = [IO.Path]::GetFullPath((Join-Path $script:projectRoot '..\..'))

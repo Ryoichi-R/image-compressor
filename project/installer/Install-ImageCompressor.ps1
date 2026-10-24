@@ -8,9 +8,9 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [ValidateSet('win-x64', 'win-arm64')]
-    [string]$Runtime,
+    [ValidateSet('auto', 'win-x64', 'win-arm64')]
+    [string]$Runtime = 'auto',
+    [switch]$DetectRuntimeOnly,
     [string]$OutputRoot,
     [switch]$OutputRootFromEnvironment,
     [switch]$SelectOutputRoot,
@@ -29,6 +29,56 @@ $productFolderName = 'Image Compressor'
 $markerName = '.image-compressor-install.json'
 $settingsName = 'settings.json'
 $executableName = 'ImageCompressor.App.exe'
+
+function ConvertTo-ImageCompressorRuntime {
+    param([Parameter(Mandatory)][ushort]$NativeMachine)
+
+    switch ($NativeMachine) {
+        0x8664 { return 'win-x64' }
+        0xAA64 { return 'win-arm64' }
+        default { throw ('Unsupported native Windows architecture: 0x{0:X4}' -f $NativeMachine) }
+    }
+}
+
+function Get-ImageCompressorNativeMachine {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        throw 'Native architecture detection requires Windows.'
+    }
+    if (-not ('ImageCompressor.Installer.NativeArchitecture' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace ImageCompressor.Installer {
+    public static class NativeArchitecture {
+        [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
+        public static ushort Read() {
+            ushort processMachine;
+            ushort nativeMachine;
+            if (!IsWow64Process2(GetCurrentProcess(), out processMachine, out nativeMachine)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return nativeMachine;
+        }
+    }
+}
+'@
+    }
+    return [ImageCompressor.Installer.NativeArchitecture]::Read()
+}
+
+function Get-ImageCompressorNativeRuntime {
+    try {
+        $nativeMachine = Get-ImageCompressorNativeMachine
+        return ConvertTo-ImageCompressorRuntime -NativeMachine $nativeMachine
+    }
+    catch {
+        throw "Unable to determine a supported native Windows architecture. Installation stopped: $($_.Exception.Message)"
+    }
+}
 
 function Get-NormalizedDirectoryPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -419,6 +469,15 @@ function Restore-Backup {
             -Destination (Join-Path $InstallDirectory $file.Name) `
             -DestinationRoot $InstallDirectory
     }
+}
+
+if ($Runtime -eq 'auto' -or $DetectRuntimeOnly) {
+    $Runtime = Get-ImageCompressorNativeRuntime
+}
+if ($DetectRuntimeOnly) {
+    # Read-only diagnostic: do not read payloads, select folders, or create state.
+    Write-Output $Runtime
+    return
 }
 
 if ([string]::IsNullOrWhiteSpace($PackageRoot)) {

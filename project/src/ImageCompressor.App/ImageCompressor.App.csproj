@@ -6,10 +6,11 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <RuntimeFrameworkVersion>10.0.10</RuntimeFrameworkVersion>
+    <RuntimeFrameworkVersion>10.0.13</RuntimeFrameworkVersion>
     <TargetLatestRuntimePatch>false</TargetLatestRuntimePatch>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="ImageCompressor.IntegrationTests" />
     <ProjectReference Include="..\ImageCompressor.Domain\ImageCompressor.Domain.csproj" />
     <ProjectReference Include="..\ImageCompressor.Infrastructure\ImageCompressor.Infrastructure.csproj" />
   </ItemGroup>
