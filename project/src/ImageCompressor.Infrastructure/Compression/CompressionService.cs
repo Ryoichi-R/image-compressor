@@ -18,30 +18,49 @@ public sealed class CompressionService
         Func<OutputPlan, bool>? confirmOverwrite = null,
         IProgress<CompressionProgress>? progress = null,
         Action<string>? log = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        Process(plans, request, confirmOverwrite, progress, log, null, cancellationToken);
+
+    public IReadOnlyList<CompressionResult> Process(
+        IReadOnlyList<OutputPlan> plans,
+        CompressionRequest request,
+        Func<OutputPlan, bool>? confirmOverwrite,
+        IProgress<CompressionProgress>? progress,
+        Action<string>? log,
+        IEnumerable<SourceItem>? protectedSources,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(plans);
         ArgumentNullException.ThrowIfNull(request);
         request.Validate();
-        Directory.CreateDirectory(request.OutputRoot);
-        foreach (var removed in fileStore.CleanupOrphans(request.OutputRoot, log))
+        var inputs = plans.Select(plan => plan.Source).Concat(protectedSources ?? []).ToArray();
+        var protection = new InputProtection(inputs);
+        var safePlans = plans.Select(plan => plan.Action != PlanAction.Skip && protection.BlocksReplacement(plan.OutputPath)
+            ? plan with { Action = PlanAction.Skip, Reason = OutputPlanner.InputProtectionReason }
+            : plan).ToArray();
+        if (!cancellationToken.IsCancellationRequested && (plans.Count == 0 ||
+            safePlans.Any(plan => plan.Action != PlanAction.Skip)))
         {
-            log?.Invoke($"孤立一時ファイルを削除: {removed}");
+            foreach (var removed in fileStore.CleanupOrphans(request.OutputRoot, log))
+            {
+                log?.Invoke($"孤立一時ファイルを削除: {removed}");
+            }
         }
 
         var results = new List<CompressionResult>(plans.Count);
         for (var index = 0; index < plans.Count; index++)
         {
-            var plan = plans[index];
+            var plan = safePlans[index];
             CompressionResult result;
+            long? originalBytes = null;
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                result = ProcessOne(plan, request, confirmOverwrite, cancellationToken);
+                result = ProcessOne(plan, request, confirmOverwrite, protection, ref originalBytes, cancellationToken);
             }
             catch (OperationCanceledException)
             {
-                result = Result(plan, ResultStatus.Cancelled, "キャンセルされました");
+                result = Result(plan, ResultStatus.Cancelled, "キャンセルされました", originalBytes: originalBytes);
                 results.Add(result);
                 progress?.Report(new(index + 1, plans.Count, plan.Source.RelativePath, result));
                 break;
@@ -50,11 +69,15 @@ public sealed class CompressionService
                 exception is IOException or UnauthorizedAccessException or
                 ArgumentException or ExternalException)
             {
-                result = Result(plan, ResultStatus.Failed, exception.Message);
+                result = Result(plan, ResultStatus.Failed, exception.Message, originalBytes: originalBytes);
             }
 
             results.Add(result);
             log?.Invoke($"{result.Status}: {plan.Source.RelativePath} - {result.Reason}");
+            foreach (var warning in result.Warnings ?? [])
+            {
+                log?.Invoke($"[WARN ] {plan.Source.RelativePath} - {warning}");
+            }
             progress?.Report(new(index + 1, plans.Count, plan.Source.RelativePath, result));
         }
 
@@ -65,6 +88,8 @@ public sealed class CompressionService
         OutputPlan plan,
         CompressionRequest request,
         Func<OutputPlan, bool>? confirmOverwrite,
+        InputProtection protection,
+        ref long? originalBytes,
         CancellationToken cancellationToken)
     {
         if (plan.Action == PlanAction.Skip)
@@ -78,58 +103,63 @@ public sealed class CompressionService
             return Result(plan, ResultStatus.Skipped, "上書きが承認されませんでした");
         }
 
-        if (plan.Source.FrameCount > 1 &&
+        using var input = File.OpenRead(plan.Source.FullPath);
+        var length = input.Length;
+        originalBytes = length;
+        using var prepared = SystemDrawingImageEngine.Prepare(input);
+        if (prepared.FrameCount > 1 &&
             request.MultiFramePolicy == MultiFramePolicy.SkipMultiFrame)
         {
-            return Result(plan, ResultStatus.Skipped, "複数フレーム画像のためスキップ");
+            return Result(plan, ResultStatus.Skipped, "複数フレーム画像のためスキップ", originalBytes: length);
         }
 
-        using var prepared = SystemDrawingImageEngine.Prepare(plan.Source.FullPath);
         var effectiveFormat = request.GetEffectiveOutputFormat();
+        if (request.TargetSizeEnabled && effectiveFormat != OutputFormat.Jpeg)
+        {
+            return Result(plan, ResultStatus.Skipped, "指定容量モードで非JPEG出力を保存しない設定", originalBytes: length);
+        }
+
+        var allowReplace = plan.Action is PlanAction.Overwrite or PlanAction.Confirm;
         var dimensions = ResizeCalculator.Calculate(
             prepared.Width,
             prepared.Height,
             request.MaxWidth,
             request.MaxHeight);
         var canCopy = request.TargetSizeEnabled &&
-            plan.Source.Length <= request.TargetBytes &&
+            length <= request.TargetBytes && prepared.FrameCount == 1 &&
             dimensions.Width == prepared.Width &&
             dimensions.Height == prepared.Height &&
             prepared.OriginalOrientation == 1 &&
             !prepared.HadMetadata &&
-            SystemDrawingImageEngine.MatchesOutputFormat(
-                plan.Source.Extension,
-                effectiveFormat);
+            prepared.SourceFormat == effectiveFormat;
 
         if (canCopy)
         {
             if (request.AlreadyWithinTargetPolicy == AlreadyWithinTargetPolicy.Skip)
             {
-                return Result(plan, ResultStatus.Skipped, "既に目標容量・寸法以内");
+                return Result(plan, ResultStatus.Skipped, "既に目標容量・寸法以内", originalBytes: length);
             }
 
             fileStore.CopySourceSafely(
-                plan.Source.FullPath,
+                input,
                 plan.OutputPath,
-                plan.Action is PlanAction.Overwrite or PlanAction.Confirm);
+                allowReplace,
+                protection.BlocksReplacement,
+                cancellationToken);
             return Result(
                 plan,
                 ResultStatus.Copied,
                 "再エンコードせずコピー",
-                plan.Source.Length,
+                length,
                 prepared.Width,
-                prepared.Height);
+                prepared.Height,
+                originalBytes: length);
         }
 
         EncodedCandidate? candidate;
         var attempts = 1;
         if (request.TargetSizeEnabled)
         {
-            if (effectiveFormat != OutputFormat.Jpeg)
-            {
-                return Result(plan, ResultStatus.Skipped, "指定容量モードで非JPEG出力を保存しない設定");
-            }
-
             var search = TargetSizeSearch.Search(
                 new(
                     request.TargetBytes,
@@ -154,7 +184,7 @@ public sealed class CompressionService
                     search.LimitReached
                         ? "試行上限までに指定容量以下へ圧縮できませんでした"
                         : "最小寸法・最低品質でも指定容量以下へ圧縮できませんでした",
-                    attempts: attempts);
+                    attempts: attempts, originalBytes: length);
             }
         }
         else
@@ -168,7 +198,12 @@ public sealed class CompressionService
                 request.JpegBackgroundBlack);
         }
 
-        var isLarger = candidate.Bytes.LongLength > plan.Source.Length;
+        if (request.TargetSizeEnabled && candidate.Bytes.LongLength > request.TargetBytes)
+        {
+            return Result(plan, ResultStatus.Failed, "出力が目標容量を超えています", attempts: attempts, originalBytes: length);
+        }
+
+        var isLarger = candidate.Bytes.LongLength > length;
         if (isLarger && request.LargerOutputPolicy == LargerOutputPolicy.Skip)
         {
             return Result(
@@ -179,11 +214,12 @@ public sealed class CompressionService
                 candidate.Width,
                 candidate.Height,
                 attempts,
-                true);
+                true,
+                length);
         }
 
         var warnings = new List<string>();
-        if (plan.Source.FrameCount > 1)
+        if (prepared.FrameCount > 1)
         {
             warnings.Add("複数フレーム画像は先頭フレームのみ出力しました");
         }
@@ -196,16 +232,18 @@ public sealed class CompressionService
         fileStore.SaveBytesSafely(
             candidate.Bytes,
             plan.OutputPath,
-            plan.Action is PlanAction.Overwrite or PlanAction.Confirm,
+            allowReplace,
             candidate.Width,
-            candidate.Height);
-        var reason = SizeChangeFormatter.Format(plan.Source.Length, candidate.Bytes.LongLength);
+            candidate.Height,
+            protection.BlocksReplacement,
+            cancellationToken);
+        var reason = SizeChangeFormatter.Format(length, candidate.Bytes.LongLength);
         return new(
             plan.Source,
             plan.OutputPath,
             ResultStatus.Success,
             reason,
-            plan.Source.Length,
+            length,
             candidate.Bytes.LongLength,
             candidate.Width,
             candidate.Height,
@@ -222,16 +260,18 @@ public sealed class CompressionService
         int width = 0,
         int height = 0,
         int attempts = 0,
-        bool isLarger = false) =>
+        bool isLarger = false,
+        long? originalBytes = null) =>
         new(
             plan.Source,
             status is ResultStatus.Success or ResultStatus.Copied ? plan.OutputPath : null,
             status,
             reason,
-            plan.Source.Length,
+            originalBytes ?? plan.Source.Length,
             outputBytes,
             width,
             height,
             attempts,
-            isLarger);
+            isLarger,
+            OriginalBytesFromScan: originalBytes is null);
 }

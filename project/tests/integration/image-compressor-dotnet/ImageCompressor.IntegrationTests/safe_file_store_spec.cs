@@ -27,15 +27,14 @@ public sealed class SafeFileStoreSpec : IDisposable
     }
 
     [Fact]
-    public void CleanupOrphans_recurses_and_removes_current_instance_immediately()
+    public void CleanupOrphans_recurses_and_removes_an_unowned_pair()
     {
         var nested = Path.Combine(root, "a", "b");
         Directory.CreateDirectory(nested);
         var store = new SafeFileStore("11111111111111111111111111111111");
-        var orphan = Path.Combine(
-            nested,
-            ".image-compressor-11111111111111111111111111111111-22222222222222222222222222222222.tmp");
+        var orphan = store.CreateTemporaryPathForTest(nested);
         File.WriteAllText(orphan, "orphan");
+        File.WriteAllText(Path.ChangeExtension(orphan, ".lease"), string.Empty);
 
         var removed = store.CleanupOrphans(root);
 
@@ -55,10 +54,10 @@ public sealed class SafeFileStoreSpec : IDisposable
         File.WriteAllText(locked, "locked");
         File.WriteAllText(foreign, "foreign");
         using var lockStream = new FileStream(
-            locked,
-            FileMode.Open,
+            Path.ChangeExtension(locked, ".lease"),
+            FileMode.CreateNew,
             FileAccess.ReadWrite,
-            FileShare.None);
+            FileShare.Delete);
 
         var removed = store.CleanupOrphans(root);
 
@@ -68,28 +67,47 @@ public sealed class SafeFileStoreSpec : IDisposable
     }
 
     [Fact]
-    public void CleanupOrphans_applies_one_hour_network_grace_to_other_instances()
+    public void CleanupOrphans_retains_legacy_and_unpaired_temp_but_removes_lease_only()
     {
         Directory.CreateDirectory(root);
-        var now = new DateTimeOffset(2026, 7, 29, 10, 0, 0, TimeSpan.Zero);
-        var store = new SafeFileStore(
-            "11111111111111111111111111111111",
-            new FixedTimeProvider(now));
-        var recent = store.CreateTemporaryPathForTest(
-            root,
-            "22222222222222222222222222222222");
-        var old = store.CreateTemporaryPathForTest(
-            root,
-            "33333333333333333333333333333333");
-        File.WriteAllText(recent, "recent");
-        File.WriteAllText(old, "old");
-        File.SetLastWriteTimeUtc(recent, now.AddMinutes(-30).UtcDateTime);
-        File.SetLastWriteTimeUtc(old, now.AddHours(-2).UtcDateTime);
+        var store = new SafeFileStore();
+        var legacy = Path.Combine(root, $".image-compressor-{Guid.NewGuid():N}-{Guid.NewGuid():N}.tmp");
+        var unpaired = store.CreateTemporaryPathForTest(root);
+        var leaseOnly = Path.ChangeExtension(store.CreateTemporaryPathForTest(root), ".lease");
+        File.WriteAllText(legacy, "old");
+        File.WriteAllText(unpaired, "unknown");
+        File.WriteAllText(leaseOnly, string.Empty);
 
-        var removed = store.CleanupOrphans(root, driveTypeOverride: DriveType.Network);
+        var warnings = new List<string>();
+        var removed = store.CleanupOrphans(root, warnings.Add);
 
-        Assert.True(File.Exists(recent));
-        Assert.Contains(old, removed);
+        Assert.Empty(removed);
+        Assert.True(File.Exists(legacy));
+        Assert.True(File.Exists(unpaired));
+        Assert.False(File.Exists(leaseOnly));
+        Assert.Equal(2, warnings.Count);
+    }
+
+    [Fact]
+    public void Active_overwrite_survives_cleanup_before_commit()
+    {
+        Directory.CreateDirectory(root);
+        var target = Path.Combine(root, "output.png");
+        File.WriteAllText(target, "old");
+        var writer = new SafeFileStore();
+        var cleaner = new SafeFileStore();
+
+        writer.SaveBytesSafely(CreatePng(12, 8), target, true, 12, 8, blocksReplacement: _ =>
+        {
+            var temporary = Assert.Single(Directory.GetFiles(root, "*.tmp"));
+            Assert.Empty(cleaner.CleanupOrphans(root));
+            Assert.True(File.Exists(temporary));
+            return false;
+        });
+
+        using var image = Image.FromFile(target);
+        Assert.Equal(new Size(12, 8), image.Size);
+        Assert.Empty(Directory.EnumerateFiles(root, ".image-compressor-*"));
     }
 
     [Fact]
@@ -102,6 +120,7 @@ public sealed class SafeFileStoreSpec : IDisposable
         var store = new SafeFileStore("11111111111111111111111111111111");
         var orphan = store.CreateTemporaryPathForTest(outside);
         File.WriteAllText(orphan, "outside");
+        File.WriteAllText(Path.ChangeExtension(orphan, ".lease"), string.Empty);
         try
         {
             try
@@ -191,8 +210,4 @@ public sealed class SafeFileStoreSpec : IDisposable
         }
     }
 
-    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
-    {
-        public override DateTimeOffset GetUtcNow() => now;
-    }
 }

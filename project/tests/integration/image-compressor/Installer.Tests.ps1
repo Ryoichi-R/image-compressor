@@ -462,7 +462,7 @@ Describe 'Image Compressor one-click installer' -Tag 'WindowsOnly' {
         )
 
         $result.ExitCode | Should -Not -Be 0
-        ($result.Output + $result.Error) | Should -Match 'previous managed installation was restored'
+        ($result.Output + $result.Error) | Should -Match 'changes made by this installation were restored'
         (Get-Content -LiteralPath $readme -Raw).Trim() |
             Should -Be 'ROLLBACK-SENTINEL'
         (Get-FileHash -LiteralPath $script:installedExe -Algorithm SHA256).Hash |

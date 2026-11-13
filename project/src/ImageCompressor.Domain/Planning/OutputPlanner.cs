@@ -5,20 +5,31 @@ public static class OutputPlanner
     public static IReadOnlyList<OutputPlan> Create(
         IEnumerable<SourceItem> sources,
         CompressionRequest request,
-        Func<string, bool>? fileExists = null)
+        Func<string, bool>? fileExists = null) =>
+        Create(sources, request, fileExists, null, null);
+
+    public static IReadOnlyList<OutputPlan> Create(
+        IEnumerable<SourceItem> sources,
+        CompressionRequest request,
+        Func<string, bool>? fileExists,
+        IEnumerable<SourceItem>? protectedSources,
+        Func<string, bool>? isProtectedAlias)
     {
         ArgumentNullException.ThrowIfNull(sources);
         ArgumentNullException.ThrowIfNull(request);
         request.Validate();
 
         fileExists ??= File.Exists;
-        var outputRoot = Path.GetFullPath(request.OutputRoot)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var outputRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(request.OutputRoot));
+        var selected = sources.ToArray();
+        var protectedPaths = selected.Concat(protectedSources ?? [])
+            .Select(source => Path.GetFullPath(source.FullPath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var plans = new List<OutputPlan>();
         var extension = GetExtension(request.GetEffectiveOutputFormat());
 
-        foreach (var source in sources)
+        foreach (var source in selected)
         {
             var relativeDirectory = request.PreserveHierarchy
                 ? Path.GetDirectoryName(source.RelativePath) ?? string.Empty
@@ -31,6 +42,8 @@ public static class OutputPlanner
             var suffix = 0;
             string candidatePath;
             string candidateName;
+            bool exists;
+            bool protectsInput;
 
             while (true)
             {
@@ -40,10 +53,12 @@ public static class OutputPlanner
                 candidatePath = Path.GetFullPath(Path.Combine(targetDirectory, candidateName));
                 EnsureUnderRoot(outputRoot, candidatePath);
                 var reservedCollision = reserved.Contains(candidatePath);
-                var diskCollision = fileExists(candidatePath);
+                exists = fileExists(candidatePath);
+                protectsInput = protectedPaths.Contains(candidatePath) ||
+                    (exists && isProtectedAlias?.Invoke(candidatePath) == true);
 
                 if (reservedCollision ||
-                    (request.CollisionPolicy == CollisionPolicy.AutoRename && diskCollision))
+                    (request.CollisionPolicy == CollisionPolicy.AutoRename && (exists || protectsInput)))
                 {
                     suffix++;
                     continue;
@@ -53,13 +68,16 @@ public static class OutputPlanner
             }
 
             reserved.Add(candidatePath);
-            var exists = fileExists(candidatePath);
             var action = PlanAction.Write;
             var reason = suffix > 0
                 ? $"出力名衝突を回避して {candidateName} を使用"
                 : string.Empty;
 
-            if (exists)
+            if (protectsInput)
+            {
+                (action, reason) = (PlanAction.Skip, InputProtectionReason);
+            }
+            else if (exists)
             {
                 (action, reason) = request.CollisionPolicy switch
                 {
@@ -75,6 +93,8 @@ public static class OutputPlanner
 
         return plans;
     }
+
+    public const string InputProtectionReason = "入力画像保護のためスキップ（別の出力先または自動連番を選択してください）";
 
     public static string GetExtension(OutputFormat format) => format switch
     {
@@ -102,12 +122,12 @@ public static class OutputPlanner
 
     private static void EnsureUnderRoot(string root, string candidate)
     {
-        var normalizedRoot = root.TrimEnd(
-            Path.DirectorySeparatorChar,
-            Path.AltDirectorySeparatorChar);
+        var normalizedRoot = Path.TrimEndingDirectorySeparator(root);
+        var prefix = Path.EndsInDirectorySeparator(normalizedRoot)
+            ? normalizedRoot : normalizedRoot + Path.DirectorySeparatorChar;
         if (!candidate.Equals(normalizedRoot, StringComparison.OrdinalIgnoreCase) &&
             !candidate.StartsWith(
-                normalizedRoot + Path.DirectorySeparatorChar,
+                prefix,
                 StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("出力先が出力root外です。");

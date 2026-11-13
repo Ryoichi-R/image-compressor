@@ -1,5 +1,7 @@
 # Image Compressor
 
+ソース版 1.0.15 では、入力原本と導入先の利用者ファイルの保護、一覧の選択と走査条件、処理中の終了待機、設定の復旧、容量判定と警告表示を修正しました。
+
 ## 概要
 
 Image Compressorは、Windows向けの画像一括縮小・圧縮アプリです。画像と設定は利用者のPC内で処理し、現行versionには外部送信、telemetry、account、自動update機能はありません。

@@ -43,7 +43,7 @@ public sealed class FailureRecoverySpec : IDisposable
         Assert.Equal(plans.Length, updates[0].Total);
         Assert.Equal(plans[0].Source.RelativePath, updates[0].FileName);
         Assert.Same(result, updates[0].Result);
-        Assert.Empty(Directory.GetFiles(Output));
+        Assert.Empty(Directory.Exists(Output) ? Directory.GetFiles(Output) : []);
     }
 
     [Fact]
@@ -66,12 +66,12 @@ public sealed class FailureRecoverySpec : IDisposable
         var request = Request(multiFrame: MultiFramePolicy.SkipMultiFrame);
         var plans = Plans(request);
         plans[0] = plans[0] with { Action = PlanAction.Skip, Reason = "planned exclusion" };
-        plans[1] = plans[1] with { Source = plans[1].Source with { FrameCount = 2 } };
+        DefectRegressionSpec.WriteTwoFrameGif(plans[1].Source.FullPath);
         var results = new CompressionService().Process(plans, request);
         Assert.All(results, result => Assert.Equal(ResultStatus.Skipped, result.Status));
         Assert.Equal("planned exclusion", results[0].Reason);
         Assert.Contains("複数フレーム", results[1].Reason);
-        Assert.Empty(Directory.GetFiles(Output));
+        Assert.Empty(Directory.Exists(Output) ? Directory.GetFiles(Output) : []);
     }
 
     [Theory]
@@ -81,9 +81,7 @@ public sealed class FailureRecoverySpec : IDisposable
     {
         var request = Request(larger: policy);
         var plans = Plans(request);
-        // Simulate scanner metadata for a multi-frame source to test service policy,
-        // independently of real multi-frame decoder acceptance.
-        plans[0] = plans[0] with { Source = plans[0].Source with { FrameCount = 2 } };
+        DefectRegressionSpec.WriteTwoFrameGif(plans[0].Source.FullPath);
         var result = Assert.Single(new CompressionService().Process([plans[0]], request));
         Assert.Equal(expected, result.Status);
         Assert.True(result.IsLarger);
@@ -92,7 +90,7 @@ public sealed class FailureRecoverySpec : IDisposable
             Assert.Equal(2, result.Warnings!.Count);
             Assert.True(result.OutputBytes > result.OriginalBytes);
         }
-        else { Assert.Empty(Directory.GetFiles(Output)); }
+        else { Assert.Empty(Directory.Exists(Output) ? Directory.GetFiles(Output) : []); }
     }
 
     [Fact]
@@ -110,7 +108,7 @@ public sealed class FailureRecoverySpec : IDisposable
         var copy = Assert.Single(new CompressionService().Process([plan], copyRequest));
         Assert.Equal(ResultStatus.Skipped, copy.Status);
         Assert.Equal(0, copy.EncodeAttempts);
-        Assert.Empty(Directory.GetFiles(Output));
+        Assert.Empty(Directory.Exists(Output) ? Directory.GetFiles(Output) : []);
     }
 
     [Fact]
@@ -121,6 +119,7 @@ public sealed class FailureRecoverySpec : IDisposable
         Directory.CreateDirectory(Output);
         var orphan = store.CreateTemporaryPathForTest(Output);
         File.WriteAllText(orphan, "synthetic orphan");
+        File.WriteAllText(Path.ChangeExtension(orphan, ".lease"), string.Empty);
         var messages = new List<string>();
         Assert.Empty(new CompressionService(store).Process([], request, log: messages.Add));
         Assert.False(File.Exists(orphan));

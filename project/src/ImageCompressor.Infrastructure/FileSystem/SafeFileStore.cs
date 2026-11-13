@@ -5,8 +5,8 @@ namespace ImageCompressor.Infrastructure;
 
 public sealed class SafeFileStore
 {
-    private const string Prefix = ".image-compressor-";
-    private readonly TimeProvider timeProvider;
+    private const string LegacyPrefix = ".image-compressor-";
+    private const string Prefix = LegacyPrefix + "v2-";
 
     public SafeFileStore(string? instanceId = null, TimeProvider? timeProvider = null)
     {
@@ -16,7 +16,6 @@ public sealed class SafeFileStore
             throw new ArgumentException("instanceIdはGUIDのN形式で指定してください。", nameof(instanceId));
         }
 
-        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public string InstanceId { get; }
@@ -26,57 +25,82 @@ public sealed class SafeFileStore
         string finalPath,
         bool allowReplace,
         int expectedWidth,
-        int expectedHeight)
+        int expectedHeight,
+        Func<string, bool>? blocksReplacement = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(bytes);
-        var finalFull = Path.GetFullPath(finalPath);
-        var directory = Path.GetDirectoryName(finalFull)
-            ?? throw new InvalidOperationException("出力directoryを解決できません。");
-        Directory.CreateDirectory(directory);
-        var temporary = CreateTemporaryPath(directory);
-        try
+        if (bytes.Length == 0)
         {
-            File.WriteAllBytes(temporary, bytes);
-            ValidateImage(temporary, expectedWidth, expectedHeight);
-            Commit(temporary, finalFull, allowReplace);
-            return finalFull;
+            throw new IOException("一時ファイルが空です。");
         }
-        finally
+
+        return Save(finalPath, allowReplace, temporary =>
         {
-            TryDelete(temporary);
-        }
+            using var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+            stream.Position = 0;
+            using var image = Image.FromStream(stream, useEmbeddedColorManagement: false, validateImageData: true);
+            if (image.Width != expectedWidth || image.Height != expectedHeight)
+            {
+                throw new IOException("保存後の画像寸法が変換結果と一致しません。");
+            }
+        }, blocksReplacement, cancellationToken);
     }
 
     public string CopySourceSafely(string sourcePath, string finalPath, bool allowReplace)
     {
-        var sourceFull = Path.GetFullPath(sourcePath);
+        using var source = File.OpenRead(sourcePath);
+        return CopySourceSafely(source, finalPath, allowReplace);
+    }
+
+    internal string CopySourceSafely(
+        Stream source, string finalPath, bool allowReplace,
+        Func<string, bool>? blocksReplacement = null, CancellationToken cancellationToken = default) =>
+        Save(finalPath, allowReplace, temporary =>
+        {
+            using var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+            source.Position = 0;
+            source.CopyTo(target);
+            target.Flush(flushToDisk: true);
+            source.Position = 0;
+            target.Position = 0;
+            if (source.Length != target.Length ||
+                !CryptographicOperations.FixedTimeEquals(SHA256.HashData(source), SHA256.HashData(target)))
+            {
+                throw new IOException("copy後の長さまたはSHA-256がsourceと一致しません。");
+            }
+        }, blocksReplacement, cancellationToken);
+
+    private string Save(string finalPath, bool allowReplace, Action<string> writeAndValidate,
+        Func<string, bool>? blocksReplacement, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         var finalFull = Path.GetFullPath(finalPath);
         var directory = Path.GetDirectoryName(finalFull)
             ?? throw new InvalidOperationException("出力directoryを解決できません。");
         Directory.CreateDirectory(directory);
-        var temporary = CreateTemporaryPath(directory);
+        var temporary = CreateTemporaryPathForTest(directory);
+        var leasePath = Path.ChangeExtension(temporary, ".lease");
+        using var lease = new FileStream(leasePath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Delete);
         try
         {
-            File.Copy(sourceFull, temporary, overwrite: false);
-            var sourceInfo = new FileInfo(sourceFull);
-            var temporaryInfo = new FileInfo(temporary);
-            if (sourceInfo.Length != temporaryInfo.Length ||
-                !CryptographicOperations.FixedTimeEquals(
-                    ComputeHash(sourceFull),
-                    ComputeHash(temporary)))
-            {
-                throw new IOException("copy後の長さまたはSHA-256がsourceと一致しません。");
-            }
-
-            Commit(temporary, finalFull, allowReplace);
+            writeAndValidate(temporary);
+            Commit(temporary, finalFull, allowReplace, blocksReplacement, cancellationToken);
             return finalFull;
         }
         finally
         {
-            TryDelete(temporary);
+            if (TryDelete(temporary))
+            {
+                TryDelete(leasePath);
+            }
         }
     }
 
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822",
+        Justification = "Keep the existing instance API while cleanup uses lease ownership.")]
     public IReadOnlyList<string> CleanupOrphans(
         string outputRoot,
         Action<string>? warning = null,
@@ -88,65 +112,87 @@ public sealed class SafeFileStore
             return removed;
         }
 
-        var driveType = driveTypeOverride ?? GetDriveType(outputRoot);
         foreach (var file in EnumerateWithoutReparsePoints(Path.GetFullPath(outputRoot)))
         {
             var name = Path.GetFileName(file);
-            if (!name.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase) ||
-                !name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
+            if (!IsTemporaryFile(file))
             {
                 continue;
             }
 
-            if (!TryParseInstanceId(name, out var ownerInstanceId))
+            var leasePath = Path.ChangeExtension(file, ".lease");
+            if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
             {
-                continue;
-            }
-
-            var isCurrentInstance = ownerInstanceId.Equals(
-                InstanceId,
-                StringComparison.OrdinalIgnoreCase);
-            if (!isCurrentInstance && driveType is DriveType.Network or DriveType.Unknown)
-            {
-                var lastWrite = new DateTimeOffset(File.GetLastWriteTimeUtc(file), TimeSpan.Zero);
-                var age = timeProvider.GetUtcNow() - lastWrite;
-                if (age < TimeSpan.FromHours(1))
+                if (!File.Exists(leasePath))
                 {
-                    continue;
+                    warning?.Invoke($"[WARN ] 所有を確認できない一時ファイルを保持します: {file}");
                 }
+
+                continue;
             }
 
             try
             {
-                using (new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                if (File.GetAttributes(leasePath).HasFlag(FileAttributes.ReparsePoint))
                 {
+                    continue;
                 }
 
-                File.Delete(file);
-                removed.Add(file);
+                using var lease = new FileStream(leasePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Delete);
+                var temporary = Path.ChangeExtension(leasePath, ".tmp");
+                if (File.Exists(temporary))
+                {
+                    if (File.GetAttributes(temporary).HasFlag(FileAttributes.ReparsePoint))
+                    {
+                        continue;
+                    }
+
+                    File.Delete(temporary);
+                    removed.Add(temporary);
+                }
+
+                File.Delete(leasePath);
+            }
+            catch (FileNotFoundException)
+            {
+                // The owner or another cleanup removed the lease after enumeration.
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                warning?.Invoke($"[WARN ] 使用中の一時ファイルを保持します: {file} ({ex.Message})");
+                warning?.Invoke($"[WARN ] 使用中または削除できない一時ファイルを保持します: {leasePath}");
             }
         }
 
         return removed;
     }
 
+    internal static bool IsTemporaryFile(string path)
+    {
+        var name = Path.GetFileName(path);
+        var extension = Path.GetExtension(name);
+        var prefix = name.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase) ? Prefix : LegacyPrefix;
+        if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+            (!extension.Equals(".tmp", StringComparison.OrdinalIgnoreCase) &&
+             !(prefix == Prefix && extension.Equals(".lease", StringComparison.OrdinalIgnoreCase))))
+        {
+            return false;
+        }
+
+        var stem = name.AsSpan(prefix.Length, name.Length - prefix.Length - extension.Length);
+        return stem.Length == 65 && stem[32] == '-' &&
+            Guid.TryParseExact(stem[..32], "N", out _) && Guid.TryParseExact(stem[33..], "N", out _);
+    }
+
     public string CreateTemporaryPathForTest(string directory, string? ownerInstanceId = null)
     {
         Directory.CreateDirectory(directory);
-        return Path.Combine(
-            directory,
-            $"{Prefix}{ownerInstanceId ?? InstanceId}-{Guid.NewGuid():N}.tmp");
+        return Path.Combine(directory, $"{Prefix}{ownerInstanceId ?? InstanceId}-{Guid.NewGuid():N}.tmp");
     }
 
-    private string CreateTemporaryPath(string directory) =>
-        CreateTemporaryPathForTest(directory);
-
-    private static void Commit(string temporary, string finalPath, bool allowReplace)
+    private static void Commit(string temporary, string finalPath, bool allowReplace,
+        Func<string, bool>? blocksReplacement, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (!File.Exists(finalPath))
         {
             File.Move(temporary, finalPath);
@@ -158,56 +204,13 @@ public sealed class SafeFileStore
             throw new IOException($"保存直前に出力ファイルが作成されました: {finalPath}");
         }
 
-        try
+        if (blocksReplacement?.Invoke(finalPath) == true)
         {
-            File.Replace(temporary, finalPath, destinationBackupFileName: null);
-        }
-        catch (PlatformNotSupportedException)
-        {
-            File.Move(temporary, finalPath, overwrite: true);
-        }
-    }
-
-    private static void ValidateImage(string path, int width, int height)
-    {
-        var info = new FileInfo(path);
-        if (!info.Exists || info.Length == 0)
-        {
-            throw new IOException("一時ファイルが空、または作成されませんでした。");
+            throw new IOException(Domain.OutputPlanner.InputProtectionReason);
         }
 
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        using var image = Image.FromStream(stream, useEmbeddedColorManagement: false, validateImageData: true);
-        if (image.Width != width || image.Height != height)
-        {
-            throw new IOException("保存後の画像寸法が変換結果と一致しません。");
-        }
-    }
-
-    private static byte[] ComputeHash(string path)
-    {
-        using var stream = File.OpenRead(path);
-        return SHA256.HashData(stream);
-    }
-
-    private static bool TryParseInstanceId(string name, out string instanceId)
-    {
-        instanceId = string.Empty;
-        var withoutPrefix = name[Prefix.Length..];
-        var separator = withoutPrefix.IndexOf('-');
-        if (separator != 32)
-        {
-            return false;
-        }
-
-        var candidate = withoutPrefix[..separator];
-        if (!Guid.TryParseExact(candidate, "N", out _))
-        {
-            return false;
-        }
-
-        instanceId = candidate;
-        return true;
+        cancellationToken.ThrowIfCancellationRequested();
+        File.Replace(temporary, finalPath, destinationBackupFileName: null);
     }
 
     private static IEnumerable<string> EnumerateWithoutReparsePoints(string root)
@@ -220,7 +223,7 @@ public sealed class SafeFileStore
             IEnumerable<string> files;
             try
             {
-                files = Directory.EnumerateFiles(current, $"{Prefix}*.tmp");
+                files = Directory.GetFiles(current, $"{LegacyPrefix}*");
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -235,7 +238,7 @@ public sealed class SafeFileStore
             IEnumerable<string> directories;
             try
             {
-                directories = Directory.EnumerateDirectories(current);
+                directories = Directory.GetDirectories(current);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -259,31 +262,16 @@ public sealed class SafeFileStore
         }
     }
 
-    private static DriveType GetDriveType(string path)
+    private static bool TryDelete(string path)
     {
         try
         {
-            var root = Path.GetPathRoot(Path.GetFullPath(path));
-            return root is null ? DriveType.Unknown : new DriveInfo(root).DriveType;
+            File.Delete(path);
+            return true;
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            return DriveType.Unknown;
-        }
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-        }
-        catch (IOException)
-        {
-            // A later job-start cleanup owns crash/orphan recovery.
+            return false;
         }
     }
 }

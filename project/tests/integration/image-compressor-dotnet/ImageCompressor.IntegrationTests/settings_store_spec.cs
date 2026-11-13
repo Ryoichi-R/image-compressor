@@ -38,7 +38,7 @@ public sealed class SettingsStoreSpec : IDisposable
 
         var settings = store.Load(out var warning);
 
-        Assert.Null(warning);
+        Assert.Contains("selectedPresetId", warning, StringComparison.Ordinal);
         Assert.Equal(Presets.DefaultId, settings.SelectedPresetId);
     }
 
@@ -62,6 +62,33 @@ public sealed class SettingsStoreSpec : IDisposable
         Assert.Equal(2, loaded.InputPaths.Count);
         Assert.Equal(TargetNonJpegPolicy.Skip, loaded.TargetNonJpegPolicy);
         Assert.Equal(Path.Combine(root, "settings.json"), store.SettingsPath);
+    }
+
+    [Theory]
+    [InlineData("{invalid")]
+    [InlineData("""{"schemaVersion":2}""")]
+    [InlineData("""{"overrides":{"maxWidth":0,"quality":88},"inputPaths":[null,"C:/images"],"collisionPolicy":"unknown"}""")]
+    public void Saving_recovered_settings_preserves_original_bytes(string json)
+    {
+        var store = StoreWith(json);
+        var original = File.ReadAllBytes(store.SettingsPath);
+
+        var settings = store.Load(out var warning);
+        Assert.NotNull(warning);
+        Assert.Equal(original, File.ReadAllBytes(store.SettingsPath));
+        if (json.Contains("overrides", StringComparison.Ordinal))
+        {
+            Assert.Null(settings.Overrides.MaxWidth);
+            Assert.Equal(88, settings.Overrides.Quality);
+            Assert.Equal("C:/images", Assert.Single(settings.InputPaths));
+            Assert.Equal(CollisionPolicy.AutoRename, settings.CollisionPolicy);
+        }
+
+        store.Save(settings);
+        var backup = Assert.Single(Directory.GetFiles(root, "*.bak"));
+        Assert.Equal(original, File.ReadAllBytes(backup));
+        store.Load(out warning);
+        Assert.Null(warning);
     }
 
     public void Dispose()

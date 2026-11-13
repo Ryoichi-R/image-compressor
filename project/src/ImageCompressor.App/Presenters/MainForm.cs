@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ImageCompressor.Domain;
 using ImageCompressor.Infrastructure;
 
@@ -51,7 +52,9 @@ public sealed class MainForm : Form
     private CancellationTokenSource? cancellation;
     private Task<IReadOnlyList<CompressionResult>>? processingTask;
     private bool applyingPreset;
-    private bool closeAfterProcessing;
+    private readonly JobState job = new();
+    private readonly ScanState scan = new();
+    private bool promptingForClose;
 
     public MainForm(IReadOnlyList<string> startupPaths, bool minimized)
         : this(startupPaths, minimized, new SettingsStore(AppContext.BaseDirectory), null)
@@ -79,6 +82,7 @@ public sealed class MainForm : Form
         WireEvents();
         LoadSettings();
         ApplyStartupPaths(startupPaths);
+        ScanOptionsChanged();
         if (minimized)
         {
             WindowState = FormWindowState.Minimized;
@@ -155,20 +159,43 @@ public sealed class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (processingTask is { IsCompleted: false } && !closeAfterProcessing)
+        if (job.IsRunning)
         {
-            var answer = showMessage(
-                "処理をキャンセルして、完了を待ってから終了しますか？",
-                "処理中です",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning);
-            e.Cancel = true;
-            if (answer == DialogResult.Yes)
+            var systemClosing = e.CloseReason is CloseReason.WindowsShutDown or CloseReason.TaskManagerClosing;
+            e.Cancel = !systemClosing;
+            if (systemClosing)
             {
-                closeAfterProcessing = true;
-                progressLabel.Text = "終了のためキャンセル待機中";
-                cancellation?.Cancel();
-                _ = CloseWhenProcessingStopsAsync();
+                RequestClose();
+                try
+                {
+                    processingTask?.Wait(TimeSpan.FromMilliseconds(250));
+                }
+                catch (AggregateException exception)
+                {
+                    System.Diagnostics.Trace.TraceError(exception.GetBaseException().Message);
+                }
+
+                base.OnFormClosing(e);
+                return;
+            }
+
+            if (!job.CloseRequested && !promptingForClose)
+            {
+                promptingForClose = true;
+                try
+                {
+                    var answer = showMessage(
+                        "処理をキャンセルして、完了を待ってから終了しますか？",
+                        "処理中です", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (answer == DialogResult.Yes)
+                    {
+                        RequestClose();
+                    }
+                }
+                finally
+                {
+                    promptingForClose = false;
+                }
             }
 
             return;
@@ -180,33 +207,18 @@ public sealed class MainForm : Form
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            showMessage(
-                exception.Message,
-                "設定保存エラー",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
+            showMessage(exception.Message, "設定保存エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         base.OnFormClosing(e);
     }
 
-    private async Task CloseWhenProcessingStopsAsync()
+    private void RequestClose()
     {
-        if (processingTask is not null)
+        if (job.RequestClose())
         {
-            try
-            {
-                await processingTask;
-            }
-            catch (OperationCanceledException)
-            {
-                // The processing service reports cancellation as a result where possible.
-            }
-        }
-
-        if (!IsDisposed)
-        {
-            BeginInvoke(Close);
+            progressLabel.Text = "終了のためキャンセル待機中";
+            cancellation?.Cancel();
         }
     }
 
@@ -339,6 +351,9 @@ public sealed class MainForm : Form
         preset.DisplayMember = nameof(PresetDefinition.DisplayName);
         preset.SelectedIndexChanged += (_, _) => ApplySelectedPreset();
         scanButton.Click += (_, _) => Scan();
+        inputPath.TextChanged += (_, _) => ScanOptionsChanged();
+        outputPath.TextChanged += (_, _) => ScanOptionsChanged();
+        includeSubfolders.CheckedChanged += (_, _) => ScanOptionsChanged();
         runButton.Click += async (_, _) => await RunAsync();
         cancelButton.Click += (_, _) =>
         {
@@ -391,47 +406,99 @@ public sealed class MainForm : Form
         };
     }
 
-    private void Scan()
+    private string[] DisplayedInputPaths() => inputPath.Text
+        .Split(" | ", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private ScanConditions ReadScanConditions()
     {
+        var paths = DisplayedInputPaths();
+        if (paths.Length == 0 || string.IsNullOrWhiteSpace(outputPath.Text))
+        {
+            throw new ArgumentException("入力と出力を指定してください。");
+        }
+
+        return ScanConditions.Create(paths, outputPath.Text, includeSubfolders.Checked);
+    }
+
+    private bool RefreshScanValidity()
+    {
+        ScanConditions? conditions;
         try
         {
-            if (!string.IsNullOrWhiteSpace(inputPath.Text))
-            {
-                inputPaths = inputPath.Text
-                    .Split(" | ", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                    .Select(Path.GetFullPath)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-            }
-
-            if (string.IsNullOrWhiteSpace(outputPath.Text))
-            {
-                throw new ArgumentException("出力フォルダを指定してください。");
-            }
-
-            var result = FileScanner.ScanInputs(
-                inputPaths,
-                outputPath.Text,
-                includeSubfolders.Checked,
-                AppendLog);
-            RenderFileList(result);
-            AppendLog($"対象候補 {result.Sources.Count}件、除外 {result.Skipped.Count}件を読み込みました。");
+            conditions = ReadScanConditions();
         }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception exception) when (exception is ArgumentException or IOException or NotSupportedException)
         {
-            showMessage(exception.Message, "一覧更新エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            conditions = null;
+        }
+
+        scan.Recheck(conditions);
+        return conditions is not null && scan.CanStart;
+    }
+
+    private void ScanOptionsChanged()
+    {
+        if (!applyingPreset && !IsRunning)
+        {
+            runButton.Enabled = RefreshScanValidity();
+            if (scan.RequiresRefresh)
+            {
+                progressLabel.Text = "一覧更新が必要";
+            }
         }
     }
 
-    private void RenderFileList(FileScanResult result)
+    private bool Scan()
+    {
+        try
+        {
+            var conditions = ReadScanConditions();
+            if (conditions.Inputs.Any(path => !File.Exists(path) && !Directory.Exists(path)))
+            {
+                throw new DirectoryNotFoundException("存在しない入力が含まれています。");
+            }
+
+            if (File.Exists(outputPath.Text))
+            {
+                throw new IOException("出力先にファイルが存在します。");
+            }
+
+            var selections = scan.MatchesLastScan(conditions)
+                ? files.Rows.Cast<DataGridViewRow>()
+                    .Where(row => row.Tag is SourceItem)
+                    .GroupBy(row => ((SourceItem)row.Tag!).FullPath, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(group => group.Key, group => group.Any(row => row.Cells["Target"].Value is true),
+                        StringComparer.OrdinalIgnoreCase)
+                : null;
+            var result = FileScanner.ScanInputs(conditions.Inputs, outputPath.Text,
+                includeSubfolders.Checked, AppendLog);
+            RenderFileList(result, selections);
+            scan.Succeeded(conditions);
+            inputPaths = [.. conditions.Inputs];
+            runButton.Enabled = true;
+            progressLabel.Text = "待機中";
+            AppendLog($"対象候補 {result.Sources.Count}件、除外 {result.Skipped.Count}件を読み込みました。");
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            scan.Failed();
+            runButton.Enabled = false;
+            progressLabel.Text = "一覧更新が必要";
+            showMessage(exception.Message, "一覧更新エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
+    private void RenderFileList(FileScanResult result, IReadOnlyDictionary<string, bool>? selections)
     {
         files.Rows.Clear();
         RefreshFileRowHeights();
         foreach (var source in result.Sources)
         {
             var index = files.Rows.Add(
-                true,
+                selections?.GetValueOrDefault(source.FullPath, true) ?? true,
                 source.RelativePath,
                 source.Extension,
                 $"{source.Length / 1024d:N1} KiB",
@@ -459,56 +526,163 @@ public sealed class MainForm : Form
 
     private async Task RunAsync()
     {
+        if (IsRunning)
+        {
+            return;
+        }
+
+        var generation = 0L;
         try
         {
-            var selected = GetSelectedSources();
-            if (selected.Length == 0)
+            if (!RefreshScanValidity())
             {
-                Scan();
-                selected = GetSelectedSources();
+                ScanOptionsChanged();
+                return;
             }
 
+            if (scan.IsUnscanned && !Scan())
+            {
+                return;
+            }
+
+            var selected = GetSelectedSources();
             if (selected.Length == 0)
             {
                 throw new ArgumentException("処理対象の画像が選択されていません。");
             }
 
+            var protectedSources = files.Rows.Cast<DataGridViewRow>()
+                .Select(row => row.Tag).OfType<SourceItem>().ToArray();
             var request = CreateRequest();
-            var plans = OutputPlanner.Create(selected, request);
+            var protection = new InputProtection(protectedSources);
+            var plans = OutputPlanner.Create(selected, request, fileExists: null, protectedSources: protectedSources,
+                isProtectedAlias: protection.BlocksReplacement);
             var confirmed = ConfirmOverwrites(plans);
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
+
+            generation = job.Begin();
+            var jobLogs = new ConcurrentQueue<string>();
             SetRunning(true);
             progressBar.Maximum = Math.Max(1, plans.Count);
             progressBar.Value = 0;
+            progressLabel.Text = "処理中";
             cancellation = new();
+            var token = cancellation.Token;
+            var rows = files.Rows.Cast<DataGridViewRow>().Where(row => row.Tag is SourceItem)
+                .ToLookup(row => (SourceItem)row.Tag!);
+            foreach (var source in selected)
+            {
+                foreach (var row in rows[source])
+                {
+                    row.Cells["Status"].Value = "待機中";
+                }
+            }
+
             var uiProgress = new Progress<CompressionProgress>(value =>
             {
+                if (IsDisposed || Disposing || !job.AcceptsProgress(generation))
+                {
+                    return;
+                }
+
+                DrainLogs(jobLogs);
                 progressBar.Value = Math.Min(progressBar.Maximum, value.Completed);
                 var percent = value.Total == 0 ? 100 : (int)Math.Round(value.Completed * 100d / value.Total);
                 progressLabel.Text = $"{value.Completed}/{value.Total} ({percent}%)";
             });
-            processingTask = Task.Run(
-                () => new CompressionService().Process(
-                    plans,
-                    request,
-                    plan => confirmed.GetValueOrDefault(plan.OutputPath),
-                    uiProgress,
-                    message => BeginInvoke(() => AppendLog(message)),
-                    cancellation.Token));
-            var results = await processingTask;
+            processingTask = Task.Run(() => new CompressionService().Process(
+                plans, request, plan => confirmed.GetValueOrDefault(plan.OutputPath),
+                uiProgress, jobLogs.Enqueue, protectedSources, token));
+            IReadOnlyList<CompressionResult> results;
+            try
+            {
+                results = await processingTask;
+            }
+            finally
+            {
+                if (!IsDisposed && !Disposing)
+                {
+                    DrainLogs(jobLogs);
+                }
+            }
+
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
+
+            var wasCancelled = token.IsCancellationRequested || results.Any(x => x.Status == ResultStatus.Cancelled);
+            if (wasCancelled)
+            {
+                foreach (var source in selected)
+                {
+                    foreach (var row in rows[source])
+                    {
+                        row.Cells["Status"].Value = "キャンセル";
+                    }
+                }
+            }
+
+            foreach (var result in results)
+            {
+                foreach (var row in rows[result.Source])
+                {
+                    row.Cells["Status"].Value = result.Warnings is { Count: > 0 }
+                        ? "警告あり" : result.Status.ToString();
+                }
+            }
+
+            var status = wasCancelled ? "キャンセル" : "完了";
+            progressLabel.Text = $"{status} / 警告 {results.Sum(x => x.Warnings?.Count ?? 0)}件";
             AppendLog(
-                $"完了: 出力 {results.Count(x => x.Status is ResultStatus.Success or ResultStatus.Copied)}" +
+                $"{progressLabel.Text}: 出力 {results.Count(x => x.Status is ResultStatus.Success or ResultStatus.Copied)}" +
+                $" / スキップ {results.Count(x => x.Status == ResultStatus.Skipped)}" +
                 $" / 失敗 {results.Count(x => x.Status == ResultStatus.Failed)} / 合計 {results.Count}");
         }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception exception)
         {
-            showMessage(exception.Message, "処理エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsDisposed && !Disposing)
+            {
+                if (generation != 0)
+                {
+                    progressLabel.Text = "処理エラー";
+                }
+
+                AppendLog($"[ERROR] {exception.Message}");
+                if (!job.CloseRequested)
+                {
+                    showMessage(exception.Message, "処理エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
         }
         finally
         {
-            cancellation?.Dispose();
-            cancellation = null;
-            SetRunning(false);
+            if (generation != 0)
+            {
+                cancellation?.Dispose();
+                cancellation = null;
+                processingTask = null;
+                var close = job.Finish();
+                if (!IsDisposed && !Disposing)
+                {
+                    SetRunning(false);
+                    if (close)
+                    {
+                        Close();
+                    }
+                }
+            }
+        }
+    }
+
+    private void DrainLogs(ConcurrentQueue<string> messages)
+    {
+        while (messages.TryDequeue(out var message))
+        {
+            AppendLog(message);
         }
     }
 
@@ -536,7 +710,7 @@ public sealed class MainForm : Form
 
     private CompressionRequest CreateRequest()
     {
-        if (inputPaths.Count == 0 || string.IsNullOrWhiteSpace(outputPath.Text))
+        if (inputPaths.Count == 0 || string.IsNullOrWhiteSpace(outputPath.Text) || File.Exists(outputPath.Text))
         {
             throw new ArgumentException("入力と出力を指定してください。");
         }
@@ -614,6 +788,7 @@ public sealed class MainForm : Form
     private void SaveSettings()
     {
         var selected = preset.SelectedItem as PresetDefinition ?? Presets.Items[0];
+        var displayedPaths = DisplayedInputPaths();
         var bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
         settingsStore.Save(new()
         {
@@ -625,8 +800,8 @@ public sealed class MainForm : Form
                 (OutputFormat)format.SelectedItem! == selected.Format
                     ? null
                     : (OutputFormat)format.SelectedItem!),
-            InputPath = inputPaths.FirstOrDefault() ?? string.Empty,
-            InputPaths = [.. inputPaths],
+            InputPath = displayedPaths.FirstOrDefault() ?? string.Empty,
+            InputPaths = [.. displayedPaths],
             OutputPath = outputPath.Text,
             TargetSizeEnabled = targetEnabled.Checked,
             TargetKilobytes = (int)targetKibibytes.Value,
@@ -712,7 +887,7 @@ public sealed class MainForm : Form
         }
 
         files.Enabled = !running;
-        runButton.Enabled = !running;
+        runButton.Enabled = !running && RefreshScanValidity();
         scanButton.Enabled = !running;
         cancelButton.Enabled = running;
     }
@@ -772,7 +947,7 @@ public sealed class MainForm : Form
         return combo;
     }
 
-    private bool IsRunning => processingTask is { IsCompleted: false };
+    private bool IsRunning => job.IsRunning;
 
     private void AppendLog(string message) =>
         log.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");

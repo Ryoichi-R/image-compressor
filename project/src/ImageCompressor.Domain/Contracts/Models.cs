@@ -204,7 +204,8 @@ public sealed record CompressionResult(
     int Height,
     int EncodeAttempts,
     bool IsLarger,
-    IReadOnlyList<string>? Warnings = null);
+    IReadOnlyList<string>? Warnings = null,
+    bool OriginalBytesFromScan = false);
 
 public sealed record CompressionProgress(
     int Completed,

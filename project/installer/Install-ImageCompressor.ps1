@@ -1,9 +1,9 @@
-<#
+﻿<#
 .SYNOPSIS
     Safely installs or updates a prebuilt Image Compressor payload.
 
 .DESCRIPTION
-    Uses temporary staging, validation, one-generation backup, running-process
+    Uses temporary staging, validation, verified backup, running-process
     rejection, a mutex, and automatic rollback. User-owned files are preserved.
 #>
 [CmdletBinding()]
@@ -18,7 +18,8 @@ param(
     [string]$PackageRoot,
     [string]$InstallerStateRoot,
     [ValidateRange(0, 100)]
-    [int]$TestFailAfterManagedFileCount = 0
+    [int]$TestFailAfterManagedFileCount = 0,
+    [scriptblock]$TestBeforeOperation
 )
 
 Set-StrictMode -Version Latest
@@ -147,7 +148,9 @@ function Assert-SafeFileName {
     if ([string]::IsNullOrWhiteSpace($Name) -or
         $Name -ne [IO.Path]::GetFileName($Name) -or
         [IO.Path]::IsPathRooted($Name) -or
-        $Name -in '.', '..') {
+        $Name.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
+        $Name.EndsWith('.') -or $Name.EndsWith(' ') -or
+        $Name -match '^(CON|PRN|AUX|NUL|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])(\.|$)') {
         throw "Payload contains an unsafe file name: $Name"
     }
     return $Name
@@ -235,18 +238,40 @@ function Select-OutputRootFolder {
     }
 }
 
-function Clear-ManagedDirectory {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$AllowedRoot,
-        [Parameter(Mandatory)][string]$ExpectedLeaf
-    )
+function Get-ExistingEntry {
+    param([Parameter(Mandatory)][string]$Path)
 
-    $safe = Assert-ManagedDirectory -Path $Path -Root $AllowedRoot -ExpectedLeaf $ExpectedLeaf
-    New-Item -ItemType Directory -Path $safe -Force | Out-Null
-    foreach ($child in Get-ChildItem -LiteralPath $safe -Force) {
-        $safeChild = Assert-PathWithinRoot -Path $child.FullName -Root $safe
-        Remove-Item -LiteralPath $safeChild -Recurse -Force
+    try {
+        return Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return $null
+    }
+}
+
+function Assert-RegularFile {
+    param([Parameter(Mandatory)]$Entry)
+
+    if ($Entry.PSIsContainer -or ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Expected a regular file: $($Entry.FullName)"
+    }
+}
+
+function Assert-FileState {
+    param([Parameter(Mandatory)][string]$Path, [string]$ExpectedHash)
+
+    $entry = Get-ExistingEntry -Path $Path
+    if ($ExpectedHash) {
+        if ($null -eq $entry) {
+            throw "Expected file is missing: $Path"
+        }
+        Assert-RegularFile -Entry $entry
+        if ((Get-FileSha256 -Path $Path) -ne $ExpectedHash) {
+            throw "File changed since the installer inspected it: $Path"
+        }
+    }
+    elseif ($null -ne $entry) {
+        throw "An entry already exists at the destination: $Path"
     }
 }
 
@@ -254,23 +279,30 @@ function Copy-FileVerified {
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination,
-        [Parameter(Mandatory)][string]$DestinationRoot
+        [Parameter(Mandatory)][string]$DestinationRoot,
+        [Parameter(Mandatory)][string]$ExpectedSourceHash,
+        [string]$ExpectedDestinationHash
     )
 
     $safeDestination = Assert-PathWithinRoot -Path $Destination -Root $DestinationRoot
-    $temporaryName = '.image-compressor-install-{0}.tmp' -f [guid]::NewGuid().ToString('N')
-    $temporary = Assert-PathWithinRoot -Path (Join-Path $DestinationRoot $temporaryName) -Root $DestinationRoot
+    $temporary = Join-Path $DestinationRoot ('.image-compressor-install-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
     try {
-        Copy-Item -LiteralPath $Source -Destination $temporary -Force
-        if ((Get-FileSha256 -Path $Source) -ne
-            (Get-FileSha256 -Path $temporary)) {
+        [IO.File]::Copy($Source, $temporary, $false)
+        if ((Get-FileSha256 -Path $temporary) -ne $ExpectedSourceHash) {
             throw "Copy verification failed: $safeDestination"
         }
-        Move-Item -LiteralPath $temporary -Destination $safeDestination -Force
+        if ($ExpectedDestinationHash) {
+            Assert-FileState -Path $safeDestination -ExpectedHash $ExpectedDestinationHash
+            [IO.File]::Replace($temporary, $safeDestination, [NullString]::Value)
+        }
+        else {
+            [IO.File]::Move($temporary, $safeDestination)
+        }
     }
     finally {
-        if (Test-Path -LiteralPath $temporary) {
-            Remove-Item -LiteralPath $temporary -Force
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            try { [IO.File]::Delete($temporary) }
+            catch { Write-Warning "Installer temporary file could not be removed: $temporary" }
         }
     }
 }
@@ -279,22 +311,59 @@ function Write-JsonAtomic {
     param(
         [Parameter(Mandatory)]$Value,
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Root
+        [Parameter(Mandatory)][string]$Root,
+        [switch]$Replace
     )
 
     $safePath = Assert-PathWithinRoot -Path $Path -Root $Root
-    $temporaryName = '.image-compressor-manifest-{0}.tmp' -f [guid]::NewGuid().ToString('N')
-    $temporary = Assert-PathWithinRoot -Path (Join-Path $Root $temporaryName) -Root $Root
+    $temporary = Join-Path $Root ('.image-compressor-manifest-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
     try {
-        $Value | ConvertTo-Json -Depth 8 |
-            Set-Content -LiteralPath $temporary -Encoding UTF8
-        $null = Get-Content -LiteralPath $temporary -Raw | ConvertFrom-Json
-        Move-Item -LiteralPath $temporary -Destination $safePath -Force
+        [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 8))
+        $null = Get-Content -LiteralPath $temporary -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($Replace) {
+            for ($attempt = 0; ; $attempt++) {
+                try {
+                    [IO.File]::Replace($temporary, $safePath, [NullString]::Value)
+                    break
+                }
+                catch {
+                    $failure = $_.Exception.GetBaseException()
+                    $errorCode = $failure.HResult -band 0xffff
+                    if ($attempt -ge 4 -or $errorCode -notin 32, 33, 1175 -or
+                        -not [IO.File]::Exists($temporary) -or -not [IO.File]::Exists($safePath)) {
+                        throw
+                    }
+                    Start-Sleep -Milliseconds 50
+                }
+            }
+        }
+        else {
+            [IO.File]::Move($temporary, $safePath)
+        }
     }
     finally {
-        if (Test-Path -LiteralPath $temporary) {
-            Remove-Item -LiteralPath $temporary -Force
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            try { [IO.File]::Delete($temporary) }
+            catch { Write-Warning "Installer temporary file could not be removed: $temporary" }
         }
+    }
+}
+
+function Get-ManagedFileNames {
+    param([Parameter(Mandatory)][object[]]$Files)
+
+    $seen = @{}
+    foreach ($file in $Files) {
+        $name = Assert-SafeFileName -Name ([string]$file.name)
+        if ($name -in $settingsName, $markerName -or $seen.ContainsKey($name) -or
+            [string]$file.sha256 -notmatch '^[A-Fa-f0-9]{64}$') {
+            throw "Invalid managed file entry: $name"
+        }
+        $seen[$name] = $true
+        $name
+    }
+    if (-not $seen.ContainsKey($executableName)) {
+        throw 'Managed file list does not include the executable.'
     }
 }
 
@@ -365,9 +434,11 @@ function Get-CurrentInstallState {
     if ($items.Count -eq 0) {
         return $null
     }
-    if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) {
+    $marker = Get-ExistingEntry -Path $MarkerPath
+    if ($null -ne $marker) {
+        Assert-RegularFile -Entry $marker
         $state = Get-Content -LiteralPath $MarkerPath -Raw | ConvertFrom-Json
-        if ($state.productId -ne $productId) {
+        if ($state.productId -ne $productId -or $state.schemaVersion -ne 1) {
             throw "Install marker belongs to another product: $MarkerPath"
         }
         return $state
@@ -387,7 +458,7 @@ function Get-CurrentInstallState {
         $settingsName
     )
     $unknown = @($items | Where-Object {
-            $_.PSIsContainer -or $_.Name -notin $legacyAllowed
+            $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $_.Name -notin $legacyAllowed
         })
     if ($unknown.Count -gt 0) {
         throw "Markerless installation contains unknown files and will not be adopted: $($unknown[0].FullName)"
@@ -410,64 +481,71 @@ function Get-CurrentInstallState {
     }
 }
 
-function Copy-CurrentInstallToBackup {
+function New-InstallOperation {
     param(
-        [Parameter(Mandatory)]$CurrentState,
-        [Parameter(Mandatory)][string]$InstallDirectory,
-        [Parameter(Mandatory)][string]$BackupDirectory,
-        [Parameter(Mandatory)][string]$BackupRoot,
-        [Parameter(Mandatory)][string]$BackupLeaf,
-        [Parameter(Mandatory)][string]$MarkerPath
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Kind,
+        [string]$Source,
+        [string]$AfterHash
     )
 
-    Clear-ManagedDirectory -Path $BackupDirectory -AllowedRoot $BackupRoot -ExpectedLeaf $BackupLeaf
-    foreach ($entry in @($CurrentState.managedFiles)) {
-        $name = Assert-SafeFileName -Name ([string]$entry.name)
-        $source = Assert-PathWithinRoot -Path (Join-Path $InstallDirectory $name) -Root $InstallDirectory
-        if (Test-Path -LiteralPath $source -PathType Leaf) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $BackupDirectory $name) -Force
-            if ((Get-FileSha256 -Path $source) -ne
-                (Get-FileSha256 -Path (Join-Path $BackupDirectory $name))) {
-                throw "Backup verification failed: $name"
-            }
+    $target = Assert-PathWithinRoot -Path (Join-Path $installDirectory $Name) -Root $installDirectory
+    $entry = Get-ExistingEntry -Path $target
+    $before = ''
+    $backup = ''
+    if ($null -ne $entry) {
+        if ($Kind -in 'Create', 'CreateSettings', 'CreateMarker') {
+            throw "Unmanaged destination entry would collide with the payload: $target"
         }
+        Assert-RegularFile -Entry $entry
+        $before = Get-FileSha256 -Path $target
+        $backup = Join-Path $backupGeneration $Name
     }
-    if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) {
-        Copy-Item -LiteralPath $MarkerPath -Destination (Join-Path $BackupDirectory $markerName) -Force
+    elseif ($Kind -in 'Replace', 'ReplaceMarker') {
+        $Kind = 'Create'
     }
-    else {
-        $legacyMarker = Join-Path $BackupDirectory $markerName
-        $CurrentState | ConvertTo-Json -Depth 8 |
-            Set-Content -LiteralPath $legacyMarker -Encoding UTF8
+
+    return [pscustomobject][ordered]@{
+        path = $target
+        kind = $Kind
+        source = $Source
+        beforeHash = $before
+        backup = $backup
+        afterHash = $AfterHash
+        status = 'Pending'
     }
 }
 
-function Restore-Backup {
-    param(
-        [Parameter(Mandatory)][string]$InstallDirectory,
-        [Parameter(Mandatory)][string]$BackupDirectory,
-        [Parameter(Mandatory)][string[]]$NewManagedFiles,
-        [Parameter(Mandatory)][bool]$RemoveCreatedSettings
-    )
+function Restore-InstallOperations {
+    param([Parameter(Mandatory)]$Transaction)
 
-    foreach ($name in @($NewManagedFiles + $markerName)) {
-        $safeName = Assert-SafeFileName -Name $name
-        $target = Assert-PathWithinRoot -Path (Join-Path $InstallDirectory $safeName) -Root $InstallDirectory
-        if (Test-Path -LiteralPath $target -PathType Leaf) {
-            Remove-Item -LiteralPath $target -Force
+    for ($index = $Transaction.operations.Count - 1; $index -ge 0; $index--) {
+        $op = $Transaction.operations[$index]
+        try {
+            if ($op.status -eq 'Started') {
+                if ($op.beforeHash) {
+                    Assert-FileState -Path $op.path -ExpectedHash $op.beforeHash
+                }
+                elseif ($null -ne (Get-ExistingEntry -Path $op.path)) {
+                    throw 'The installer could not confirm ownership of this entry.'
+                }
+            }
+            elseif ($op.status -eq 'Applied') {
+                Assert-FileState -Path $op.path -ExpectedHash $op.afterHash
+                if ($op.beforeHash) {
+                    Copy-FileVerified -Source $op.backup -Destination $op.path -DestinationRoot $installDirectory `
+                        -ExpectedSourceHash $op.beforeHash -ExpectedDestinationHash $op.afterHash
+                }
+                else {
+                    [IO.File]::Delete($op.path)
+                }
+                Assert-FileState -Path $op.path -ExpectedHash $op.beforeHash
+                $op.status = 'Restored'
+            }
         }
-    }
-    if ($RemoveCreatedSettings) {
-        $settingsPath = Assert-PathWithinRoot -Path (Join-Path $InstallDirectory $settingsName) -Root $InstallDirectory
-        if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
-            Remove-Item -LiteralPath $settingsPath -Force
+        catch {
+            Write-Output "$($op.path): $($_.Exception.Message)"
         }
-    }
-    foreach ($file in Get-ChildItem -LiteralPath $BackupDirectory -File -Force) {
-        Copy-FileVerified `
-            -Source $file.FullName `
-            -Destination (Join-Path $InstallDirectory $file.Name) `
-            -DestinationRoot $InstallDirectory
     }
 }
 
@@ -594,11 +672,13 @@ $backupDirectory = Assert-ManagedDirectory `
 
 $mutex = [Threading.Mutex]::new($false, "Local\ImageCompressor-Installer-$installHash")
 $lockTaken = $false
+$operationId = [guid]::NewGuid().ToString('N')
+$backupGeneration = Join-Path $backupDirectory "generation-$operationId"
+$journalPath = Join-Path $installerStateRoot "transaction-$installHash.json"
+$backupPointer = Join-Path $backupDirectory 'latest.json'
+$transaction = $null
+$transactionStarted = $false
 $backupPrepared = $false
-$settingsCreated = $false
-$installDirectoryCreated = $false
-$applyStarted = $false
-$newManagedNames = @()
 
 try {
     try {
@@ -611,9 +691,32 @@ try {
         throw 'Another Image Compressor installation/update is already running for this destination.'
     }
 
+    $previous = Get-ExistingEntry -Path $journalPath
+    if ($null -ne $previous) {
+        Assert-RegularFile -Entry $previous
+        $record = Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($record.state -notin 'Committed', 'RolledBack') {
+            $remaining = @($record.operations | Where-Object { $_.status -in 'Started', 'Applied' } |
+                ForEach-Object { $_.path })
+            throw "An unfinished install is recorded at $journalPath. Backup: $($record.backupGeneration). Review: $($remaining -join ', ')"
+        }
+    }
+
+    $newManagedNames = @(Get-ManagedFileNames -Files @($payload.managedFiles))
+    $initialMarker = Get-ExistingEntry -Path $markerPath
+    $markerHash = ''
+    if ($null -ne $initialMarker) {
+        Assert-RegularFile -Entry $initialMarker
+        $markerHash = Get-FileSha256 -Path $markerPath
+    }
     $currentState = Get-CurrentInstallState `
         -InstallDirectory $installDirectory `
         -MarkerPath $markerPath
+    Assert-FileState -Path $markerPath -ExpectedHash $markerHash
+    $oldNames = @()
+    if ($null -ne $currentState) {
+        $oldNames = @(Get-ManagedFileNames -Files @($currentState.managedFiles))
+    }
     $running = @(Get-InstalledProcess -ExecutablePath $installedExe)
     if ($running.Count -gt 0 -or (Test-ExecutableLocked -Path $installedExe)) {
         throw 'Image Compressor is running from the update target. Close ImageCompressor.App.exe, then run this installer again.'
@@ -641,9 +744,6 @@ try {
         $archive.Dispose()
     }
 
-    $newManagedNames = @($payload.managedFiles | ForEach-Object {
-            Assert-SafeFileName -Name ([string]$_.name)
-        })
     foreach ($entry in @($payload.managedFiles)) {
         $name = Assert-SafeFileName -Name ([string]$entry.name)
         $stagedFile = Assert-PathWithinRoot -Path (Join-Path $stagingDirectory $name) -Root $stagingDirectory
@@ -666,57 +766,6 @@ try {
             $Runtime, $expectedMachine, $actualMachine)
     }
 
-    if ($null -ne $currentState) {
-        New-Item -ItemType Directory -Path $backupsRoot -Force | Out-Null
-        Copy-CurrentInstallToBackup `
-            -CurrentState $currentState `
-            -InstallDirectory $installDirectory `
-            -BackupDirectory $backupDirectory `
-            -BackupRoot $backupsRoot `
-            -BackupLeaf $backupLeaf `
-            -MarkerPath $markerPath
-        $backupPrepared = $true
-    }
-
-    $applyStarted = $true
-    if (-not (Test-Path -LiteralPath $installDirectory)) {
-        New-Item -ItemType Directory -Path $installDirectory | Out-Null
-        $installDirectoryCreated = $true
-    }
-    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
-        Copy-FileVerified `
-            -Source $stagedSettings `
-            -Destination $settingsPath `
-            -DestinationRoot $installDirectory
-        $settingsCreated = $true
-    }
-
-    $copied = 0
-    foreach ($entry in @($payload.managedFiles)) {
-        $name = Assert-SafeFileName -Name ([string]$entry.name)
-        Copy-FileVerified `
-            -Source (Join-Path $stagingDirectory $name) `
-            -Destination (Join-Path $installDirectory $name) `
-            -DestinationRoot $installDirectory
-        $copied++
-        if ($TestFailAfterManagedFileCount -gt 0 -and
-            $copied -ge $TestFailAfterManagedFileCount) {
-            throw "Test-only simulated update failure after $copied managed file(s)."
-        }
-    }
-
-    if ($null -ne $currentState) {
-        $oldNames = @($currentState.managedFiles | ForEach-Object {
-                Assert-SafeFileName -Name ([string]$_.name)
-            })
-        foreach ($oldName in $oldNames | Where-Object { $_ -notin $newManagedNames }) {
-            $obsolete = Assert-PathWithinRoot -Path (Join-Path $installDirectory $oldName) -Root $installDirectory
-            if (Test-Path -LiteralPath $obsolete -PathType Leaf) {
-                Remove-Item -LiteralPath $obsolete -Force
-            }
-        }
-    }
-
     $installedAt = if ($null -ne $currentState -and $currentState.installedAt) {
         [string]$currentState.installedAt
     }
@@ -734,7 +783,100 @@ try {
         userOwnedFiles = @($settingsName)
         managedFiles = @($payload.managedFiles)
     }
-    Write-JsonAtomic -Value $installedManifest -Path $markerPath -Root $installDirectory
+    $stagedMarker = Join-Path $stagingDirectory $markerName
+    Write-JsonAtomic -Value $installedManifest -Path $stagedMarker -Root $stagingDirectory
+
+    $operations = [Collections.Generic.List[object]]::new()
+    $existingSettings = Get-ExistingEntry -Path $settingsPath
+    if ($null -eq $existingSettings) {
+        $operations.Add((New-InstallOperation -Name $settingsName -Kind CreateSettings -Source $stagedSettings `
+                -AfterHash (Get-FileSha256 -Path $stagedSettings)))
+    }
+    else {
+        Assert-RegularFile -Entry $existingSettings
+    }
+    foreach ($entry in @($payload.managedFiles)) {
+        $name = [string]$entry.name
+        $kind = if ($name -in $oldNames) { 'Replace' } else { 'Create' }
+        $operations.Add((New-InstallOperation -Name $name -Kind $kind `
+                -Source (Join-Path $stagingDirectory $name) -AfterHash ([string]$entry.sha256)))
+    }
+    foreach ($name in $oldNames | Where-Object { $_ -notin $newManagedNames }) {
+        $operation = New-InstallOperation -Name $name -Kind Remove
+        if ($operation.beforeHash) {
+            $operations.Add($operation)
+        }
+    }
+    Assert-FileState -Path $markerPath -ExpectedHash $markerHash
+    $markerKind = if ($markerHash) { 'ReplaceMarker' } else { 'CreateMarker' }
+    $operations.Add((New-InstallOperation -Name $markerName -Kind $markerKind -Source $stagedMarker `
+            -AfterHash (Get-FileSha256 -Path $stagedMarker)))
+
+    $existingOperations = @($operations | Where-Object beforeHash)
+    if ($existingOperations.Count -gt 0) {
+        New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
+        New-Item -ItemType Directory -Path $backupGeneration | Out-Null
+        foreach ($op in $existingOperations) {
+            Copy-FileVerified -Source $op.path -Destination $op.backup -DestinationRoot $backupGeneration `
+                -ExpectedSourceHash $op.beforeHash
+        }
+        $backupPrepared = $true
+    }
+
+    New-Item -ItemType Directory -Path $installerStateRoot -Force | Out-Null
+    $transaction = [ordered]@{
+        schemaVersion = 1
+        id = $operationId
+        installDirectory = $installDirectory
+        backupGeneration = $backupGeneration
+        state = 'Applying'
+        operations = $operations.ToArray()
+    }
+    Write-JsonAtomic -Value $transaction -Path $journalPath -Root $installerStateRoot -Replace:($null -ne $previous)
+    $transactionStarted = $true
+    if ($backupPrepared) {
+        Write-JsonAtomic -Value @{ generation = $backupGeneration; transaction = $operationId } `
+            -Path $backupPointer -Root $backupDirectory -Replace:([IO.File]::Exists($backupPointer))
+    }
+
+    if (-not (Test-Path -LiteralPath $installDirectory)) {
+        New-Item -ItemType Directory -Path $installDirectory | Out-Null
+    }
+    $copied = 0
+    foreach ($op in $operations) {
+        $op.status = 'Started'
+        Write-JsonAtomic -Value $transaction -Path $journalPath -Root $installerStateRoot -Replace
+        if ($null -ne $TestBeforeOperation) {
+            & $TestBeforeOperation $op.path $op.kind
+        }
+
+        if ($op.kind -eq 'Remove') {
+            Assert-FileState -Path $op.path -ExpectedHash $op.beforeHash
+            [IO.File]::Delete($op.path)
+        }
+        else {
+            try {
+                Copy-FileVerified -Source $op.source -Destination $op.path -DestinationRoot $installDirectory `
+                    -ExpectedSourceHash $op.afterHash -ExpectedDestinationHash $op.beforeHash
+            }
+            catch {
+                if (-not $op.beforeHash) {
+                    # Create-new uses an atomic move. An unsuccessful move never owns the destination.
+                    $op.status = 'NotApplied'
+                }
+                throw
+            }
+        }
+
+        $op.status = 'Applied'
+        Write-JsonAtomic -Value $transaction -Path $journalPath -Root $installerStateRoot -Replace
+        if ($op.kind -in 'Create', 'Replace') {
+            $copied++
+            if ($TestFailAfterManagedFileCount -gt 0 -and $copied -ge $TestFailAfterManagedFileCount) {
+                throw "Test-only simulated update failure after $copied managed file(s)."
+            }
+        }
+    }
 
     foreach ($entry in @($payload.managedFiles)) {
         $installed = Join-Path $installDirectory ([string]$entry.name)
@@ -747,12 +889,15 @@ try {
         throw 'Portable settings file is missing after installation.'
     }
 
+    $transaction.state = 'Committed'
+    Write-JsonAtomic -Value $transaction -Path $journalPath -Root $installerStateRoot -Replace
+    $transactionStarted = $false
     Write-Host "Image Compressor $Runtime was installed or updated successfully." -ForegroundColor Green
     Write-Host "Install folder: $installDirectory" -ForegroundColor Green
     Write-Host "Executable: $installedExe" -ForegroundColor Green
     Write-Host 'The application was not started automatically.' -ForegroundColor Cyan
     if ($backupPrepared) {
-        Write-Host "One previous managed generation is retained at: $backupDirectory" -ForegroundColor Yellow
+        Write-Host "Verified pre-update files are retained at: $backupGeneration" -ForegroundColor Yellow
     }
     if ($RevealOutput) {
         try {
@@ -765,37 +910,25 @@ try {
 }
 catch {
     $originalError = $_
-    try {
-        if ($applyStarted -and
-            (Test-Path -LiteralPath $installDirectory -PathType Container)) {
-            if ($backupPrepared) {
-                Restore-Backup `
-                    -InstallDirectory $installDirectory `
-                    -BackupDirectory $backupDirectory `
-                    -NewManagedFiles $newManagedNames `
-                    -RemoveCreatedSettings $settingsCreated
-                Write-Host 'The previous managed installation was restored.' -ForegroundColor Yellow
+    if ($transactionStarted) {
+        try {
+            $remaining = @(Restore-InstallOperations -Transaction $transaction)
+            if ($remaining.Count -eq 0) {
+                $transaction.state = 'RolledBack'
+                Write-JsonAtomic -Value $transaction -Path $journalPath -Root $installerStateRoot -Replace
+                Write-Host 'The changes made by this installation were restored.' -ForegroundColor Yellow
             }
             else {
-                foreach ($name in @($newManagedNames + $markerName)) {
-                    $safeName = Assert-SafeFileName -Name $name
-                    $path = Assert-PathWithinRoot -Path (Join-Path $installDirectory $safeName) -Root $installDirectory
-                    if (Test-Path -LiteralPath $path -PathType Leaf) {
-                        Remove-Item -LiteralPath $path -Force
-                    }
-                }
-                if ($settingsCreated -and (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
-                    Remove-Item -LiteralPath $settingsPath -Force
-                }
-                if ($installDirectoryCreated -and
-                    @(Get-ChildItem -LiteralPath $installDirectory -Force).Count -eq 0) {
-                    Remove-Item -LiteralPath $installDirectory -Force
-                }
+                $transaction.state = 'RollbackIncomplete'
+                $transaction.unrestored = $remaining
+                Write-JsonAtomic -Value $transaction -Path $journalPath -Root $installerStateRoot -Replace
+                Write-Warning "Automatic rollback incomplete. Record: $journalPath. Backup: $backupGeneration."
+                $remaining | ForEach-Object { Write-Warning $_ }
             }
         }
-    }
-    catch {
-        Write-Error "Automatic rollback also failed: $($_.Exception.Message)"
+        catch {
+            Write-Warning "Automatic rollback could not finish: $($_.Exception.Message). Record: $journalPath. Backup: $backupGeneration."
+        }
     }
     throw $originalError
 }

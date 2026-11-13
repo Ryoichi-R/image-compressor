@@ -11,12 +11,14 @@ public sealed class PreparedImage : IDisposable
         Bitmap bitmap,
         int orientation,
         bool hadMetadata,
-        OutputFormat sourceFormat)
+        OutputFormat? sourceFormat,
+        int frameCount)
     {
         Bitmap = bitmap;
         OriginalOrientation = orientation;
         HadMetadata = hadMetadata;
         SourceFormat = sourceFormat;
+        FrameCount = frameCount;
     }
 
     internal Bitmap Bitmap { get; }
@@ -29,7 +31,9 @@ public sealed class PreparedImage : IDisposable
 
     public bool HadMetadata { get; }
 
-    public OutputFormat SourceFormat { get; }
+    public OutputFormat? SourceFormat { get; }
+
+    public int FrameCount { get; }
 
     public void Dispose() => Bitmap.Dispose();
 }
@@ -44,23 +48,51 @@ public sealed class SystemDrawingImageEngine
             path,
             FileMode.Open,
             FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete);
+            FileShare.Read);
+        return Prepare(stream);
+    }
+
+    // The caller owns the stream. The returned bitmap is independent of it.
+    public static PreparedImage Prepare(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        var position = stream.Position;
+        try
+        {
+            stream.Position = 0;
+            return Decode(stream);
+        }
+        finally
+        {
+            stream.Position = position;
+        }
+    }
+
+    private static PreparedImage Decode(Stream stream)
+    {
         using var source = Image.FromStream(stream, useEmbeddedColorManagement: false, validateImageData: true);
+        var sourceFormat = GetSourceFormat(source.RawFormat);
+        var frames = GetFrameCount(source);
         var orientation = ReadOrientation(source);
         var hadMetadata = source.PropertyIdList.Any(IsUserMetadata);
         ApplyOrientation(source, orientation);
 
         var bitmap = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb);
-        bitmap.SetResolution(
-            NormalizeDpi(source.HorizontalResolution),
-            NormalizeDpi(source.VerticalResolution));
-        using (var graphics = Graphics.FromImage(bitmap))
+        try
         {
+            bitmap.SetResolution(
+                NormalizeDpi(source.HorizontalResolution),
+                NormalizeDpi(source.VerticalResolution));
+            using var graphics = Graphics.FromImage(bitmap);
             graphics.CompositingMode = CompositingMode.SourceCopy;
             graphics.DrawImage(source, 0, 0, source.Width, source.Height);
+            return new(bitmap, orientation, hadMetadata, sourceFormat, frames);
         }
-
-        return new(bitmap, orientation, hadMetadata, GetSourceFormat(path));
+        catch
+        {
+            bitmap.Dispose();
+            throw;
+        }
     }
 
     public static EncodedCandidate Encode(
@@ -177,14 +209,18 @@ public sealed class SystemDrawingImageEngine
         image.RotateFlip(rotateFlip);
     }
 
-    private static OutputFormat GetSourceFormat(string path) =>
-        Path.GetExtension(path).ToLowerInvariant() switch
-        {
-            ".jpg" or ".jpeg" => OutputFormat.Jpeg,
-            ".png" => OutputFormat.Png,
-            ".bmp" => OutputFormat.Bmp,
-            _ => OutputFormat.Jpeg,
-        };
+    private static OutputFormat? GetSourceFormat(ImageFormat format)
+    {
+        if (format.Equals(ImageFormat.Jpeg)) return OutputFormat.Jpeg;
+        if (format.Equals(ImageFormat.Png)) return OutputFormat.Png;
+        if (format.Equals(ImageFormat.Bmp)) return OutputFormat.Bmp;
+        return null;
+    }
+
+    internal static int GetFrameCount(Image image) => image.FrameDimensionsList
+        .Select(dimension => image.GetFrameCount(new FrameDimension(dimension)))
+        .DefaultIfEmpty(1)
+        .Max();
 
     private static float NormalizeDpi(float dpi) =>
         float.IsFinite(dpi) && dpi > 0 ? dpi : 96f;

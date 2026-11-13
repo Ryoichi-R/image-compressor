@@ -145,17 +145,16 @@ public sealed class CompressionServiceSpec : IDisposable
         var output = Path.Combine(root, "multi-output");
         Directory.CreateDirectory(input);
         var path = Path.Combine(input, "multi.gif");
-        CreateImage(path, 2, 2, ImageFormat.Gif);
+        DefectRegressionSpec.WriteTwoFrameGif(path);
         var scanned = Assert.Single(FileScanner.Scan(input, output, false));
-        var multi = scanned with { FrameCount = 2 };
         var skipRequest = Request(input, output, MultiFramePolicy.SkipMultiFrame);
-        var skipPlan = Assert.Single(OutputPlanner.Create([multi], skipRequest));
+        var skipPlan = Assert.Single(OutputPlanner.Create([scanned], skipRequest));
 
         var skipped = Assert.Single(new CompressionService().Process([skipPlan], skipRequest));
 
         Assert.Equal(ResultStatus.Skipped, skipped.Status);
         var warnRequest = Request(input, output, MultiFramePolicy.FirstFrameWithWarning);
-        var warnPlan = Assert.Single(OutputPlanner.Create([multi], warnRequest));
+        var warnPlan = Assert.Single(OutputPlanner.Create([scanned], warnRequest));
         var warned = Assert.Single(new CompressionService().Process([warnPlan], warnRequest));
         Assert.Contains(
             warned.Warnings ?? [],

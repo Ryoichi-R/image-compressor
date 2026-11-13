@@ -21,13 +21,15 @@ PowerShell 版は移行期間中 `Core (PS)`、C# 版は `Domain/Core (.NET)` �
 
 ## 安全保存契約
 
-確定出力と同じディレクトリへ `.image-compressor-<launch-guid>-<guid>.tmp` を作り、画像の再読込と寸法検証後に move/replace する。成功・例外時は `finally` で一時ファイルを削除する。
+出力と同じディレクトリーに `.image-compressor-v2-<instance-guid>-<operation-guid>.lease` を作り、同じ操作 ID の `.tmp` の書き込み、検証、確定、後始末まで保持する。入力は画像ごとに書き込み・削除共有を拒むハンドルで開き、実際の形式・フレーム数・容量の判定からコピーまたはエンコードの確定まで同じ入力を使う。既存出力を置換する前には、走査済み入力とのパスおよび Windows ファイル ID の照合を行う。
 
-job 開始時に出力 root 以下を再帰走査し、reparse point は辿らない。自 launch ID の孤児は即時、他 launch ID は排他 open 可能な場合だけ削除する。Network/Unknown drive の他 ID は最終更新から1時間を猶予とする。
+出力先の掃除では子 reparse point を辿らず、lease を取得できた場合だけ対応する一時ファイルを回収する。lease だけが残った場合は lease を回収する。旧形式および lease のない tmp は保持して警告する。ネットワーク上でも経過時間による削除は行わない。
+
+通常のウィンドウ閉鎖と `ApplicationExitCall` はキャンセル要求後に処理結果の反映と UI の後始末を待つ。OS シャットダウンとタスクマネージャーによる終了要求では、キャンセルを通知して最大 250ms だけ worker を待つ。キャンセル後の未確定出力は保存確定を中止し、強制終了で残った一時ファイルは次回に回収する。
 
 ## 設定
 
-EXE と同じディレクトリに `settings.json` が既に存在する場合は portable 設定として優先し、なければ `%LOCALAPPDATA%\ImageCompressor\settings.json` を使う。固定プリセット値はコードを正本とし、設定にはプリセット ID と変更された値だけを保存する。
+EXE と同じディレクトリに `settings.json` が既に存在する場合は portable 設定として優先し、なければ `%LOCALAPPDATA%\ImageCompressor\settings.json` を使う。固定プリセット値はコードを正本とし、設定にはプリセット ID と変更された値だけを保存する。不正な項目は個別に既定値へ戻し、読めない形式や未対応の schema は既定設定で起動する。修復済み設定を保存する際は同じディレクトリーに元の bytes を退避し、退避できない原本は上書きしない。
 
 画面位置は `Screen.AllScreens` の各作業領域と64px以上交差する場合だけ復元する。
 

@@ -56,7 +56,7 @@ public sealed class MainFormWorkflowSpec
         Assert.Contains("対象 0件", Field<Label>(form, "summaryLabel").Text);
         typeof(Control).GetMethod("OnClick", BindingFlags.Instance | BindingFlags.NonPublic)!
             .Invoke(Field<Button>(form, "scanButton"), [EventArgs.Empty]);
-        Assert.Contains("対象 1件", Field<Label>(form, "summaryLabel").Text);
+        Assert.Contains("対象 0件", Field<Label>(form, "summaryLabel").Text);
         Assert.True(File.Exists(image));
     });
 
@@ -152,7 +152,7 @@ public sealed class MainFormWorkflowSpec
         Assert.Contains(test.Messages, message => message.Caption == "一覧更新エラー");
         Field<TextBox>(form, "outputPath").Text = test.Output;
         Pump((Task)Call(form, "RunAsync")!);
-        Assert.Contains(test.Messages, message => message.Caption == "処理エラー");
+        Assert.False(Field<Button>(form, "runButton").Enabled);
         Assert.True(Field<Button>(form, "scanButton").Enabled);
         Assert.False(Field<Button>(form, "cancelButton").Enabled);
         Field<TextBox>(form, "inputPath").Text = test.Input;
@@ -174,12 +174,14 @@ public sealed class MainFormWorkflowSpec
         Assert.Single(Field<DataGridView>(form, "files").Rows.Cast<DataGridViewRow>());
         Assert.Equal(Path.Combine(test.Input, "compressed"), Field<TextBox>(form, "outputPath").Text);
         var blocked = new TaskCompletionSource<IReadOnlyList<CompressionResult>>();
+        Field<JobState>(form, "job").Begin();
         Set(form, "processingTask", blocked.Task);
         CallControl(form, "OnDragEnter", drag);
         Assert.Equal(DragDropEffects.None, drag.Effect);
         CallControl(form, "OnDragDrop", drag);
         Assert.Contains(test.Messages, message => message.Caption == "D&D");
         blocked.SetResult([]);
+        Field<JobState>(form, "job").Finish();
         CallControl(form, "OnDragEnter", new DragEventArgs(new DataObject("text"), 0, 0, 0, DragDropEffects.Copy, DragDropEffects.None));
         Call(form, "ApplyStartupPaths", (object)new[] { Path.Combine(test.Root, "missing") });
         Assert.Single(Field<DataGridView>(form, "files").Rows.Cast<DataGridViewRow>());
@@ -198,32 +200,43 @@ public sealed class MainFormWorkflowSpec
         Assert.True(token.IsCancellationRequested);
         Assert.Contains("キャンセル要求済み", Field<Label>(form, "progressLabel").Text);
         var processing = new TaskCompletionSource<IReadOnlyList<CompressionResult>>();
+        var job = Field<JobState>(form, "job");
+        var generation = job.Begin();
         Set(form, "processingTask", processing.Task);
         test.Answer = DialogResult.No;
         var declined = new FormClosingEventArgs(CloseReason.UserClosing, false);
         Call(form, "OnFormClosing", declined);
         Assert.True(declined.Cancel);
-        Assert.False(Field<bool>(form, "closeAfterProcessing"));
+        Assert.False(job.CloseRequested);
         test.Answer = DialogResult.Yes;
         var accepted = new FormClosingEventArgs(CloseReason.UserClosing, false);
         Call(form, "OnFormClosing", accepted);
         Assert.True(accepted.Cancel);
-        Assert.True(Field<bool>(form, "closeAfterProcessing"));
+        Assert.True(job.CloseRequested);
+        var repeated = new FormClosingEventArgs(CloseReason.UserClosing, false);
+        Call(form, "OnFormClosing", repeated);
+        Assert.True(repeated.Cancel);
+        Assert.False(job.AcceptsProgress(generation));
         processing.SetResult([]);
-        Pump((Task)Call(form, "CloseWhenProcessingStopsAsync")!);
-        Application.DoEvents();
+        Assert.True(job.IsRunning);
+        Assert.True(job.Finish());
+        Assert.False(job.Finish());
+        form.Close();
         Assert.True(File.Exists(test.Store.SettingsPath));
     });
 
     [Fact]
-    public void Closing_a_cancelled_processing_task_still_reaches_normal_close() => Sta(() =>
+    public void Old_progress_is_rejected_after_finish_and_after_a_new_job_starts()
     {
-        using var test = new Fixture();
-        using var form = test.Form();
-        Set(form, "processingTask", Task.FromCanceled<IReadOnlyList<CompressionResult>>(new CancellationToken(true)));
-        Pump((Task)Call(form, "CloseWhenProcessingStopsAsync")!);
-        Assert.True(form.IsDisposed);
-    });
+        var job = new JobState();
+        var old = job.Begin();
+        Assert.True(job.AcceptsProgress(old));
+        Assert.False(job.Finish());
+        Assert.False(job.AcceptsProgress(old));
+        var current = job.Begin();
+        Assert.False(job.AcceptsProgress(old));
+        Assert.True(job.AcceptsProgress(current));
+    }
 
     [Fact]
     public void Invalid_settings_warn_and_failed_settings_save_is_reported() => Sta(() =>

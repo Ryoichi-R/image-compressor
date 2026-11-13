@@ -1,5 +1,4 @@
 using System.Drawing;
-using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using ImageCompressor.Domain;
 
@@ -76,6 +75,11 @@ public static class FileScanner
                 : [root];
             foreach (var path in candidatePaths)
             {
+                if (SafeFileStore.IsTemporaryFile(path))
+                {
+                    continue;
+                }
+
                 var extension = Path.GetExtension(path);
                 if (!SupportedExtensions.Contains(extension))
                 {
@@ -94,7 +98,7 @@ public static class FileScanner
                         stream,
                         useEmbeddedColorManagement: false,
                         validateImageData: true);
-                    var frameCount = GetFrameCount(image);
+                    var frameCount = SystemDrawingImageEngine.GetFrameCount(image);
                     var fileInfo = new FileInfo(path);
                     var inputRoot = Directory.Exists(root)
                         ? root
@@ -140,11 +144,12 @@ public static class FileScanner
         string outputRoot)
     {
         var stack = new Stack<string>();
+        var excludedRoot = GetExcludedOutputRoot(inputRoot, outputRoot);
         stack.Push(inputRoot);
         while (stack.Count > 0)
         {
             var current = stack.Pop();
-            if (IsSameOrUnder(current, outputRoot) && !PathsEqual(current, inputRoot))
+            if (string.Equals(current, excludedRoot, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -196,32 +201,12 @@ public static class FileScanner
         }
     }
 
-    private static int GetFrameCount(Image image)
+    public static string? GetExcludedOutputRoot(string inputRoot, string outputRoot)
     {
-        var maximum = 1;
-        foreach (var dimension in image.FrameDimensionsList)
-        {
-            maximum = Math.Max(maximum, image.GetFrameCount(new FrameDimension(dimension)));
-        }
-
-        return maximum;
-    }
-
-    private static bool PathsEqual(string left, string right) =>
-        string.Equals(
-            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar),
-            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar),
-            StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsSameOrUnder(string candidate, string root)
-    {
-        var normalizedCandidate = Path.GetFullPath(candidate)
-            .TrimEnd(Path.DirectorySeparatorChar);
-        var normalizedRoot = Path.GetFullPath(root)
-            .TrimEnd(Path.DirectorySeparatorChar);
-        return normalizedCandidate.Equals(normalizedRoot, StringComparison.OrdinalIgnoreCase) ||
-            normalizedCandidate.StartsWith(
-                normalizedRoot + Path.DirectorySeparatorChar,
-                StringComparison.OrdinalIgnoreCase);
+        var input = Path.TrimEndingDirectorySeparator(Path.GetFullPath(inputRoot));
+        var output = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outputRoot));
+        var prefix = Path.EndsInDirectorySeparator(input) ? input : input + Path.DirectorySeparatorChar;
+        return output.Length > prefix.Length && output.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? output : null;
     }
 }
